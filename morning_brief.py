@@ -85,28 +85,45 @@ def fetch_weather() -> str:
 
 
 def fetch_calendar_events() -> str:
-    """Fetch today's events + next 7 days from Google Calendar."""
+    """Fetch today's events + next 7 days from primary + subscribed calendars."""
     try:
         service = get_calendar_service()
         now_et = datetime.datetime.now(MONTREAL_TZ)
         today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
         week_end = today_start + datetime.timedelta(days=8)
 
-        events_result = service.events().list(
-            calendarId="primary",
-            timeMin=today_start.isoformat(),
-            timeMax=week_end.isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=50,
-        ).execute()
+        # Calendars to check: primary + the two shared/subscribed ones
+        calendar_ids = [
+            "primary",
+            "REMOVED_CALENDAR_ID",
+            "REMOVED_CALENDAR_ID",
+        ]
 
-        events = events_result.get("items", [])
-        if not events:
+        all_events = []
+        for cal_id in calendar_ids:
+            try:
+                events_result = service.events().list(
+                    calendarId=cal_id,
+                    timeMin=today_start.isoformat(),
+                    timeMax=week_end.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=50,
+                ).execute()
+                all_events.extend(events_result.get("items", []))
+            except Exception as cal_err:
+                print(f"Warning: could not read calendar {cal_id[:20]}...: {cal_err}")
+
+        if not all_events:
             return "No events found."
 
+        # Sort merged events by start time
+        def sort_key(e):
+            return e["start"].get("dateTime") or e["start"].get("date")
+        all_events.sort(key=sort_key)
+
         lines = []
-        for e in events:
+        for e in all_events:
             start_raw = e["start"].get("dateTime") or e["start"].get("date")
             end_raw = e["end"].get("dateTime") or e["end"].get("date")
             summary = e.get("summary", "(no title)")
@@ -128,23 +145,37 @@ def fetch_calendar_events() -> str:
 
 
 def fetch_emails() -> str:
-    """Fetch unread emails from the last 24 hours, skipping newsletters/promos."""
+    """Report inbox total + unread counts, then list relevant unread from last 24h."""
     try:
         service = get_gmail_service()
+
+        # Total emails in inbox (read + unread)
+        total_result = service.users().messages().list(
+            userId="me", q="label:inbox", maxResults=1,
+        ).execute()
+        total_count = total_result.get("resultSizeEstimate", 0)
+
+        # Unread count in inbox
+        unread_result = service.users().messages().list(
+            userId="me", q="label:inbox is:unread", maxResults=1,
+        ).execute()
+        unread_count = unread_result.get("resultSizeEstimate", 0)
+
+        count_line = f"Inbox: {total_count} emails total ({unread_count} unread)."
+
+        # Relevant unread from last 24h (skipping promos/social/updates/newsletters)
         since = int((datetime.datetime.now() - datetime.timedelta(hours=24)).timestamp())
         query = f"is:unread after:{since} -category:promotions -category:social -category:updates -label:newsletters"
 
         results = service.users().messages().list(
-            userId="me",
-            q=query,
-            maxResults=30,
+            userId="me", q=query, maxResults=30,
         ).execute()
 
         messages = results.get("messages", [])
         if not messages:
-            return "No relevant unread emails."
+            return f"{count_line}\nNo relevant unread emails in the last 24h."
 
-        email_lines = []
+        email_lines = [count_line, ""]
         for msg in messages:
             detail = service.users().messages().get(
                 userId="me",
@@ -189,11 +220,7 @@ Here is the raw data. Produce my morning brief as clean HTML (no markdown) with 
 {email_data}
 
 4. 📰 NEWS
-Search the web for breaking news from the last 12–24 hours. Cover three areas:
-- 🇨🇦 Canada/Quebec: federal politics, Quebec politics, major policy or legal developments.
-- 🌍 International: significant geopolitical events, elections, conflicts, major diplomatic moves.
-- 📈 Financial: markets, central bank moves, major corporate news, macro developments (focus on North America and global impact).
-Keep each item to one sentence. Aim for 3–5 bullets per area. Skip fluff — only genuinely significant developments.
+Search is not available here — write a placeholder: "News unavailable (search not enabled in this run). Check CBC, Le Devoir, or Reuters."
 
 ---
 
@@ -202,7 +229,7 @@ FORMAT RULES:
 - Use a clean, readable style with inline CSS. White background, dark text, max-width 600px.
 - Each section has a bold header with the emoji.
 - Calendar: list today's events first under "Today", then flag notable events in the next 7 days under "Coming up".
-- Inbox: for each email, show sender (bold), subject, and one-line summary. Skip anything that looks like a newsletter or promo even if it slipped through. If the inbox is clean, say so.
+- Inbox: START with the count line exactly as given (e.g. "47 emails total (6 unread)") as the first line of the section. THEN list each relevant email with sender (bold), subject, and one-line summary. Skip anything that looks like a newsletter or promo even if it slipped through. If there are no relevant emails, keep the count line and say the inbox has nothing needing attention.
 - Weather: give a 2-line summary — current conditions and high/low — plus one sentence of advice if warranted (umbrella, layers, etc.).
 - End with a short "⚡ Action items" section: a bullet list of anything from calendar or inbox that seems to require action today.
 - Keep the whole thing concise. Aim for something readable in under 2 minutes.
@@ -213,10 +240,9 @@ FORMAT RULES:
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
         system=system,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
     )
 
-    return next(block.text for block in message.content if hasattr(block, "text"))
+    return message.content[0].text
 
 
 # ── Email Sender ──────────────────────────────────────────────────────────────
