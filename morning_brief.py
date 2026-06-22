@@ -216,7 +216,7 @@ FORMAT RULES:
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
     )
 
-    return message.content[0].text
+    return next(block.text for block in message.content if hasattr(block, "text"))
 
 
 # ── Email Sender ──────────────────────────────────────────────────────────────
