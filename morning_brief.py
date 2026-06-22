@@ -152,17 +152,12 @@ def fetch_emails() -> str:
     try:
         service = get_gmail_service()
 
-        # Total emails in inbox (read + unread)
-        total_result = service.users().messages().list(
-            userId="me", q="label:inbox", maxResults=1,
+        # Exact inbox counts via the INBOX label metadata (not an estimate)
+        label_info = service.users().labels().get(
+            userId="me", id="INBOX",
         ).execute()
-        total_count = total_result.get("resultSizeEstimate", 0)
-
-        # Unread count in inbox
-        unread_result = service.users().messages().list(
-            userId="me", q="label:inbox is:unread", maxResults=1,
-        ).execute()
-        unread_count = unread_result.get("resultSizeEstimate", 0)
+        total_count = label_info.get("messagesTotal", 0)
+        unread_count = label_info.get("messagesUnread", 0)
 
         count_line = f"Inbox: {total_count} emails total ({unread_count} unread)."
 
@@ -264,46 +259,41 @@ def _decode_email_body(payload) -> str:
     return body_text.strip()
 
 
-def fetch_news() -> str:
-    """Find today's newsletters, extract their text, and have Claude pick top articles."""
-    try:
-        service = get_gmail_service()
+def fetch_news_from_newsletters(service) -> str:
+    """Find today's newsletters and have Claude pick top articles. Returns '' if none found."""
+    # Senders to pull newsletters from
+    sender_query = (
+        "from:globeandmail OR from:globeandmailnewsletters OR "
+        "from:economist.com OR from:nytimes.com OR from:theguardian.com"
+    )
+    # Only today's (last 18h to be safe, catches early-morning sends)
+    since = int((datetime.datetime.now() - datetime.timedelta(hours=18)).timestamp())
+    query = f"({sender_query}) after:{since}"
 
-        # Senders to pull newsletters from
-        sender_query = (
-            "from:globeandmail OR from:globeandmailnewsletters OR "
-            "from:economist.com OR from:nytimes.com OR from:theguardian.com"
-        )
-        # Only today's (last 18h to be safe, catches early-morning sends)
-        since = int((datetime.datetime.now() - datetime.timedelta(hours=18)).timestamp())
-        query = f"({sender_query}) after:{since}"
+    results = service.users().messages().list(
+        userId="me", q=query, maxResults=10,
+    ).execute()
+    messages = results.get("messages", [])
 
-        results = service.users().messages().list(
-            userId="me", q=query, maxResults=10,
+    if not messages:
+        return ""  # signal: no newsletters → caller falls back to web
+
+    newsletters = []
+    for msg in messages:
+        detail = service.users().messages().get(
+            userId="me", id=msg["id"], format="full",
         ).execute()
-        messages = results.get("messages", [])
+        headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+        sender = headers.get("From", "Unknown")
+        subject = headers.get("Subject", "(no subject)")
+        body = _decode_email_body(detail["payload"])
+        body = body[:12000]  # cap to keep token cost sane
+        newsletters.append(f"=== From: {sender} | Subject: {subject} ===\n{body}")
 
-        if not messages:
-            return "No newsletters found in inbox this morning."
+    combined = "\n\n".join(newsletters)
 
-        newsletters = []
-        for msg in messages:
-            detail = service.users().messages().get(
-                userId="me", id=msg["id"], format="full",
-            ).execute()
-            headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
-            sender = headers.get("From", "Unknown")
-            subject = headers.get("Subject", "(no subject)")
-            body = _decode_email_body(detail["payload"])
-            # Cap each newsletter to keep token cost sane
-            body = body[:12000]
-            newsletters.append(f"=== From: {sender} | Subject: {subject} ===\n{body}")
-
-        combined = "\n\n".join(newsletters)
-
-        # Ask Claude to curate (no web search — pure text input, cheap)
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        news_prompt = f"""Below are the raw contents of this morning's news newsletters from my inbox (Globe and Mail, Economist, NYT, Guardian).
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    news_prompt = f"""Below are the raw contents of this morning's news newsletters from my inbox (Globe and Mail, Economist, NYT, Guardian).
 
 Pick the 5-10 most interesting and significant stories. Group related items if multiple outlets cover the same story. For each, give:
 - A one-sentence summary
@@ -317,14 +307,56 @@ Return plain text only (no HTML, no markdown headers). Format each item as:
 Newsletters:
 {combined}"""
 
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            messages=[{"role": "user", "content": news_prompt}],
-        )
-        return message.content[0].text
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": news_prompt}],
+    )
+    text = next((b.text for b in message.content if hasattr(b, "text")), "")
+    return text.strip()
+
+
+def fetch_news_from_web() -> str:
+    """Fallback: web search for top stories when no newsletters are available."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    web_prompt = """Search the web for the most significant news from the last 24 hours. Cover three areas:
+- 🇨🇦 Canada/Quebec: federal politics, Quebec politics, major policy or legal developments.
+- 🌍 International: significant geopolitical events, elections, conflicts, major diplomatic moves.
+- 📈 Financial: markets, central bank moves, major corporate news, macro developments.
+
+Give 5-10 stories total. For each: a one-sentence summary followed by a source link.
+Return plain text only (no HTML, no markdown headers). Format each item as:
+• [summary] — [url]
+Skip fluff — only genuinely significant developments."""
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        messages=[{"role": "user", "content": web_prompt}],
+    )
+    # Response has search tool blocks + text blocks; grab all text and join
+    text_parts = [b.text for b in message.content if hasattr(b, "text")]
+    return "\n".join(text_parts).strip() or "News unavailable."
+
+
+def fetch_news() -> str:
+    """Try newsletters first; fall back to web search if none are found."""
+    try:
+        service = get_gmail_service()
+        newsletter_news = fetch_news_from_newsletters(service)
+        if newsletter_news:
+            return newsletter_news + "\n\n(Source: your morning newsletters)"
+        # No newsletters today → web fallback
+        web_news = fetch_news_from_web()
+        return web_news + "\n\n(Source: web search — no newsletters found this morning)"
     except Exception as e:
-        return f"Could not fetch news: {e}"
+        # If newsletters fail for any reason, still try the web before giving up
+        try:
+            web_news = fetch_news_from_web()
+            return web_news + "\n\n(Source: web search fallback)"
+        except Exception as e2:
+            return f"Could not fetch news: {e} / {e2}"
 
 
 # ── Claude Call ───────────────────────────────────────────────────────────────
@@ -371,7 +403,7 @@ FORMAT RULES:
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=2000,
+        max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
         system=system,
     )
