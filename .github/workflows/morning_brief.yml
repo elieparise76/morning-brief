@@ -2,10 +2,12 @@ name: Morning Brief
 
 on:
   schedule:
-    # 7:30 AM ET = 11:30 UTC (EST) / 11:30 UTC (EDT is 7:30 AM = 11:30 UTC)
-    # EST (UTC-5): 12:30 UTC | EDT (UTC-4): 11:30 UTC
-    # Use 11:30 UTC to target 7:30 AM EDT (summer). Adjust to 12:30 for winter if needed.
+    # Backup trigger (GitHub's own cron — unreliable, may run late or be skipped).
+    # 7:30 AM EDT = 11:30 UTC (summer) / change to 12:30 UTC for EST (winter).
     - cron: '30 11 * * 1-5'
+  repository_dispatch:
+    # Primary trigger — fired by cron-job.org at exactly 7:30 AM ET.
+    types: [morning-brief]
   workflow_dispatch: # allows manual trigger from GitHub UI
 
 jobs:
