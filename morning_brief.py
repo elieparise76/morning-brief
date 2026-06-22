@@ -264,7 +264,8 @@ def fetch_news_from_newsletters(service) -> str:
     # Senders to pull newsletters from
     sender_query = (
         "from:globeandmail OR from:globeandmailnewsletters OR "
-        "from:economist.com OR from:nytimes.com OR from:theguardian.com"
+        "from:economist.com OR from:nytimes.com OR from:nytdirect OR "
+        "from:theguardian.com"
     )
     # Only today's (last 18h to be safe, catches early-morning sends)
     since = int((datetime.datetime.now() - datetime.timedelta(hours=18)).timestamp())
