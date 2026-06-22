@@ -189,7 +189,11 @@ Here is the raw data. Produce my morning brief as clean HTML (no markdown) with 
 {email_data}
 
 4. 📰 NEWS
-Search is not available here — write a placeholder: "News unavailable (search not enabled in this run). Check CBC, Le Devoir, or Reuters."
+Search the web for breaking news from the last 12–24 hours. Cover three areas:
+- 🇨🇦 Canada/Quebec: federal politics, Quebec politics, major policy or legal developments.
+- 🌍 International: significant geopolitical events, elections, conflicts, major diplomatic moves.
+- 📈 Financial: markets, central bank moves, major corporate news, macro developments (focus on North America and global impact).
+Keep each item to one sentence. Aim for 3–5 bullets per area. Skip fluff — only genuinely significant developments.
 
 ---
 
@@ -209,6 +213,7 @@ FORMAT RULES:
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
         system=system,
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
     )
 
     return message.content[0].text
