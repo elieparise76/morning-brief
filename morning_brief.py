@@ -9,6 +9,9 @@ import os
 import json
 import base64
 import datetime
+import re
+import html
+from html.parser import HTMLParser
 import pytz
 import requests
 from email.mime.multipart import MIMEMultipart
@@ -194,8 +197,138 @@ def fetch_emails() -> str:
         return f"Could not fetch emails: {e}"
 
 
+# ── Newsletter News ───────────────────────────────────────────────────────────
+class _TextExtractor(HTMLParser):
+    """Strips HTML to plain text but keeps <a href> links inline as: text (url)."""
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self._current_href = None
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "head"):
+            self._skip = True
+        if tag == "a":
+            for name, val in attrs:
+                if name == "href":
+                    self._current_href = val
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head"):
+            self._skip = False
+        if tag == "a" and self._current_href:
+            self.parts.append(f" ({self._current_href})")
+            self._current_href = None
+        if tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            text = data.strip()
+            if text:
+                self.parts.append(text + " ")
+
+    def get_text(self):
+        out = "".join(self.parts)
+        out = html.unescape(out)
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        out = re.sub(r"[ \t]{2,}", " ", out)
+        return out.strip()
+
+
+def _decode_email_body(payload) -> str:
+    """Recursively pull the HTML (or plain text) body out of a Gmail message payload."""
+    body_html = ""
+    body_text = ""
+
+    def walk(part):
+        nonlocal body_html, body_text
+        mime = part.get("mimeType", "")
+        data = part.get("body", {}).get("data")
+        if data:
+            decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            if mime == "text/html":
+                body_html += decoded
+            elif mime == "text/plain":
+                body_text += decoded
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(payload)
+
+    if body_html:
+        parser = _TextExtractor()
+        parser.feed(body_html)
+        return parser.get_text()
+    return body_text.strip()
+
+
+def fetch_news() -> str:
+    """Find today's newsletters, extract their text, and have Claude pick top articles."""
+    try:
+        service = get_gmail_service()
+
+        # Senders to pull newsletters from
+        sender_query = (
+            "from:globeandmail OR from:globeandmailnewsletters OR "
+            "from:economist.com OR from:nytimes.com OR from:theguardian.com"
+        )
+        # Only today's (last 18h to be safe, catches early-morning sends)
+        since = int((datetime.datetime.now() - datetime.timedelta(hours=18)).timestamp())
+        query = f"({sender_query}) after:{since}"
+
+        results = service.users().messages().list(
+            userId="me", q=query, maxResults=10,
+        ).execute()
+        messages = results.get("messages", [])
+
+        if not messages:
+            return "No newsletters found in inbox this morning."
+
+        newsletters = []
+        for msg in messages:
+            detail = service.users().messages().get(
+                userId="me", id=msg["id"], format="full",
+            ).execute()
+            headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+            sender = headers.get("From", "Unknown")
+            subject = headers.get("Subject", "(no subject)")
+            body = _decode_email_body(detail["payload"])
+            # Cap each newsletter to keep token cost sane
+            body = body[:12000]
+            newsletters.append(f"=== From: {sender} | Subject: {subject} ===\n{body}")
+
+        combined = "\n\n".join(newsletters)
+
+        # Ask Claude to curate (no web search — pure text input, cheap)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        news_prompt = f"""Below are the raw contents of this morning's news newsletters from my inbox (Globe and Mail, Economist, NYT, Guardian).
+
+Pick the 5-10 most interesting and significant stories. Group related items if multiple outlets cover the same story. For each, give:
+- A one-sentence summary
+- The article link (pull the actual article URL from the newsletter text — it appears in parentheses after the link text)
+
+Prioritize: major Canada/Quebec news, significant international events, financial/markets/macro. Skip lifestyle fluff, puzzles, recipes, horoscopes, and pure opinion unless notably important.
+
+Return plain text only (no HTML, no markdown headers). Format each item as:
+• [summary] — [url]
+
+Newsletters:
+{combined}"""
+
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": news_prompt}],
+        )
+        return message.content[0].text
+    except Exception as e:
+        return f"Could not fetch news: {e}"
+
+
 # ── Claude Call ───────────────────────────────────────────────────────────────
-def generate_brief(weather_data: str, calendar_data: str, email_data: str, today_str: str) -> str:
+def generate_brief(weather_data: str, calendar_data: str, email_data: str, news_data: str, today_str: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     system = (
@@ -220,7 +353,7 @@ Here is the raw data. Produce my morning brief as clean HTML (no markdown) with 
 {email_data}
 
 4. 📰 NEWS
-Search is not available here — write a placeholder: "News unavailable (search not enabled in this run). Check CBC, Le Devoir, or Reuters."
+{news_data}
 
 ---
 
@@ -230,6 +363,7 @@ FORMAT RULES:
 - Each section has a bold header with the emoji.
 - Calendar: list today's events first under "Today", then flag notable events in the next 7 days under "Coming up".
 - Inbox: START with the count line exactly as given (e.g. "47 emails total (6 unread)") as the first line of the section. THEN list each relevant email with sender (bold), subject, and one-line summary. Skip anything that looks like a newsletter or promo even if it slipped through. If there are no relevant emails, keep the count line and say the inbox has nothing needing attention.
+- News: present the curated stories as a clean bullet list. Each bullet is the one-sentence summary with the article title/source linked (use the URL provided as an <a href> link). Keep links clickable. Group related items if the data already grouped them.
 - Weather: give a 2-line summary — current conditions and high/low — plus one sentence of advice if warranted (umbrella, layers, etc.).
 - End with a short "⚡ Action items" section: a bullet list of anything from calendar or inbox that seems to require action today.
 - Keep the whole thing concise. Aim for something readable in under 2 minutes.
@@ -273,8 +407,11 @@ def main():
     print("Fetching emails...")
     emails = fetch_emails()
 
+    print("Fetching news from newsletters...")
+    news = fetch_news()
+
     print("Generating brief with Claude...")
-    html = generate_brief(weather, calendar, emails, today_str)
+    html = generate_brief(weather, calendar, emails, news, today_str)
 
     print("Sending email...")
     gmail = get_gmail_service()
