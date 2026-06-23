@@ -100,7 +100,6 @@ def fetch_calendar_events() -> str:
             "primary",
             "REMOVED_CALENDAR_ID",
             "REMOVED_CALENDAR_ID",
-            "REMOVED_CALENDAR_ID",
         ]
 
         all_events = []
@@ -297,21 +296,44 @@ def fetch_news_from_newsletters(service) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     news_prompt = f"""Below are the raw contents of this morning's news newsletters from my inbox (Globe and Mail, Economist, NYT, Guardian).
 
-Pick the 5-10 most interesting and significant stories. Group related items if multiple outlets cover the same story. For each, give:
-- A one-sentence summary
-- The article link (pull the actual article URL from the newsletter text — it appears in parentheses after the link text)
+I read the news hourly, so I already know the big headlines. DON'T just recap what happened — I know that. Your job is to surface the SPECIFIC ANGLE: the new detail, the follow-up development, the analysis, the consequence I might have missed.
 
-Prioritize: major Canada/Quebec news, significant international events, financial/markets/macro. Skip lifestyle fluff, puzzles, recipes, horoscopes, and pure opinion unless notably important.
+HOW TO HANDLE EACH STORY:
+- For major breaking news: give a brief one-line recap for context, then emphasize the specifics — and pull those specifics from ACROSS the different newsletters. Each outlet often has a different angle; synthesize them into one story.
+  Example of the style I want:
+  "Montréal shooting: the killer's motive was revealed as [X] (Globe). Police are now warning of potential copycats (NYT)."
+  → One story, multiple sources, each adding a distinct specific — not the same recap repeated.
+- Group all coverage of the same event into a SINGLE story, even if 3 outlets cover it. A story can carry multiple links.
 
-Return plain text only (no HTML, no markdown headers). Format each item as:
-• [summary] — [url]
+SELECTION:
+- Aim for 5-10 STORIES (not articles — one story can bundle several links). It's fine to exceed 10 links total if the stories warrant it.
+- Target a rough balance across these four buckets (a guide, not a hard quota — don't force filler if a bucket is thin):
+  • 🇨🇦 Canada / Quebec (~25%)
+  • 🇺🇸 United States (~25%)
+  • 🌍 International (~25%)
+  • 📈 Business / markets / macro (~25%)
+
+WHAT INTERESTS ME, BY BUCKET:
+- 🇨🇦 Canada/Quebec: federal AND Quebec politics; constitutional law broadly (the courts, the Charter, anything judicial or legal); party and parliamentary affairs; criminal law; environment; the economy; the French language. Quebec issues of any kind interest me. Favor the specific angle and analysis here — I follow this closely.
+- 🇺🇸 United States: federal politics broadly, especially constitutional debates. I like sharp opinion pieces on current political trends. Favor angle and analysis.
+- 🌍 International: general international news — I'm less expert here, so I'm more open to straightforward breaking-news coverage, not just angles. Cover ASIA when relevant, not only Europe and North America. Don't let this bucket become Europe-only.
+- 📈 Business/markets: anything genuinely interesting — public and private market trends, economic and regulatory policy, and technology.
+
+- Beyond the big shared stories, INCLUDE narrower or single-source pieces (including opinion/analysis) when they fit the interests above. Skip lifestyle fluff, puzzles, recipes, horoscopes, and generic opinion that doesn't touch these interests.
+
+FORMAT:
+- Return plain text only (no HTML, no markdown headers).
+- Order the stories by bucket: Canada/Quebec first, then US, then International, then Business/markets.
+- Each story on its own line as:
+• [one-line recap if needed +] the specific angle(s), with source attributions inline — [url1] [url2]
+- Pull the actual article URLs from the newsletter text (they appear in parentheses after the link text).
 
 Newsletters:
 {combined}"""
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1500,
+        max_tokens=2500,
         messages=[{"role": "user", "content": news_prompt}],
     )
     text = next((b.text for b in message.content if hasattr(b, "text")), "")
@@ -397,7 +419,7 @@ FORMAT RULES:
 - Each section has a bold header with the emoji.
 - Calendar: list today's events first under "Today", then flag notable events in the next 7 days under "Coming up".
 - Inbox: START with the count line exactly as given (e.g. "47 emails total (6 unread)") as the first line of the section. THEN list each relevant email with sender (bold), subject, and one-line summary. Skip anything that looks like a newsletter or promo even if it slipped through. If there are no relevant emails, keep the count line and say the inbox has nothing needing attention.
-- News: present the curated stories as a clean bullet list. Each bullet is the one-sentence summary with the article title/source linked (use the URL provided as an <a href> link). Keep links clickable. Group related items if the data already grouped them.
+- News: the news data is already organized by geographic bucket (Canada/Quebec, US, International, Business/markets) and may group several source links per story. Preserve that order and grouping. Render each story as a bullet; make every source link a clickable <a href> using the outlet name as the link text (e.g. "Globe", "NYT"). Keep multiple links on the same story inline. Do not reorder or merge the stories.
 - Weather: give a 2-line summary — current conditions and high/low — plus one sentence of advice if warranted (umbrella, layers, etc.).
 - End with a short "⚡ Action items" section: a bullet list of anything from calendar or inbox that seems to require action today.
 - Keep the whole thing concise. Aim for something readable in under 2 minutes.
