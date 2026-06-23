@@ -100,6 +100,7 @@ def fetch_calendar_events() -> str:
             "primary",
             "REMOVED_CALENDAR_ID",
             "REMOVED_CALENDAR_ID",
+            "REMOVED_CALENDAR_ID",
         ]
 
         all_events = []
