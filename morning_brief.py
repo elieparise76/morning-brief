@@ -78,9 +78,17 @@ def fetch_weather() -> str:
             feels = item["main"]["feels_like"]
             wind = item["wind"]["speed"]
             pop = item.get("pop", 0) * 100
+            # Actual precipitation VOLUME in mm over the 3h window (not just probability).
+            rain_mm = item.get("rain", {}).get("3h", 0)
+            snow_mm = item.get("snow", {}).get("3h", 0)
+            precip = ""
+            if rain_mm:
+                precip += f", rain {rain_mm:.1f}mm/3h"
+            if snow_mm:
+                precip += f", snow {snow_mm:.1f}mm/3h"
             lines.append(
                 f"{dt.strftime('%H:%M')}: {desc}, {temp:.0f}°C (feels {feels:.0f}°C), "
-                f"wind {wind:.0f} m/s, {pop:.0f}% chance of rain"
+                f"wind {wind:.0f} m/s, {pop:.0f}% chance{precip}"
             )
         return "\n".join(lines)
     except Exception as e:
@@ -247,6 +255,8 @@ class _TextExtractor(HTMLParser):
         if tag == "a" and self._current_href:
             self.parts.append(f" ({self._current_href})")
             self._current_href = None
+        if tag in ("td", "th"):
+            self.parts.append(" | ")  # keep table cells separated (e.g. market data rows)
         if tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3"):
             self.parts.append("\n")
 
@@ -335,7 +345,7 @@ HOW TO HANDLE EACH STORY:
 
 SELECTION:
 - Aim for 5-10 STORIES (not articles — one story can bundle several links). It's fine to exceed 10 links total if the stories warrant it.
-- Target a rough balance across these four buckets (a guide, not a hard quota — don't force filler if a bucket is thin):
+- Target a rough balance across these four buckets (~25% each). It's a guide, not a hard quota — BUT if a bucket has source material in the newsletters, you MUST represent it. Never silently drop a whole bucket that has content available. Only let a bucket be thin if the newsletters genuinely contain little/nothing for it that morning. The business/markets bucket in particular is frequently under-filled — actively check for a markets/business newsletter and pull from it.
   • 🇨🇦 Canada / Quebec (~25%)
   • 🇺🇸 United States (~25%)
   • 🌍 International (~25%)
@@ -345,7 +355,7 @@ WHAT INTERESTS ME, BY BUCKET:
 - 🇨🇦 Canada/Quebec: federal AND Quebec politics; constitutional law broadly (the courts, the Charter, anything judicial or legal); party and parliamentary affairs; criminal law; environment; the economy; the French language. Quebec issues of any kind interest me. Favor the specific angle and analysis here — I follow this closely.
 - 🇺🇸 United States: federal politics broadly, especially constitutional debates. I like sharp opinion pieces on current political trends. Favor angle and analysis.
 - 🌍 International: general international news — I'm less expert here, so I'm more open to straightforward breaking-news coverage, not just angles. Cover ASIA when relevant, not only Europe and North America. Don't let this bucket become Europe-only.
-- 📈 Business/markets: anything genuinely interesting — public and private market trends, economic and regulatory policy, and technology.
+- 📈 Business/markets: anything genuinely interesting — public and private market trends, economic and regulatory policy, technology, central banks, major corporate news. IMPORTANT: the "skip what I already know / give me the angle" rule applies LESS here. For markets, the DATA ITSELF is what I want, even if I "know" it — index moves (S&P, Nasdaq, TSX, KOSPI, etc.), notable earnings (who reports today, who beat/missed), big corporate moves (IPOs, bond sales, lawsuits, M&A), key macro prints (PMI, CPI, rate decisions). If a business/markets newsletter is present (e.g. Economist "Business in Brief"), you MUST surface its key market data and top business stories — do NOT drop this bucket. A concise markets line (e.g. "S&P −1.5%, Nasdaq −2.2% on AI-overvaluation fears; Micron earnings today") is exactly what I want.
 
 - Beyond the big shared stories, INCLUDE narrower or single-source pieces (including opinion/analysis) when they fit the interests above. Skip lifestyle fluff, puzzles, recipes, horoscopes, and generic opinion that doesn't touch these interests.
 
@@ -361,7 +371,7 @@ Newsletters:
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=2500,
+        max_tokens=4000,
         messages=[{"role": "user", "content": news_prompt}],
     )
     text = next((b.text for b in message.content if hasattr(b, "text")), "")
@@ -418,7 +428,11 @@ def generate_brief(weather_data: str, calendar_data: str, email_data: str, starr
     system = (
         "You are a personal assistant generating a concise morning brief. "
         "Be direct and scannable. No fluff. Use the raw data provided to produce "
-        "a structured HTML email. The recipient is Élie, a law student in Montréal."
+        "a structured HTML email. The recipient is Élie, a law student in Montréal. "
+        "Write the ENTIRE brief in English (section headers, summaries, everything). "
+        "Keep proper nouns and event titles in their original language as they appear "
+        "in the data (e.g. a calendar event 'Souper entre chéris' stays as is), but all "
+        "of your own prose — headers, the TL;DR, summaries, advice — must be in English."
     )
 
     prompt = f"""Today is {today_str}. I'm in Montréal, QC (America/Toronto timezone).
@@ -448,14 +462,14 @@ FORMAT RULES:
 - Output ONLY valid HTML (no markdown, no backticks).
 - Use a clean, readable style with inline CSS. White background, dark text, max-width 600px.
 - Each section has a bold header with the emoji.
-- TL;DR — at the VERY TOP, before weather, write a short "En bref" paragraph (bold header "En bref"). This is a single flowing prose paragraph in FRENCH that synthesizes ACROSS all the sections — it is the most valuable part, so surface cross-cutting things no single section sees on its own (e.g. an unread/starred email from someone I'm meeting today; a tight turnaround between two calendar events; a deadline due today; a market move that touches my holdings). Lead with the day's "shape" (busy/calm, any firm deadline), then the 2-4 things that actually matter. ALWAYS include it, but SCALE IT TO THE DAY: on a calm day keep it to one or two sentences ("Journée tranquille : rien d'urgent, [one notable thing]. Beau temps."); on a busy day it can run 3-5 sentences. Don't pad a quiet day to sound eventful. Write it last (after you've seen all sections) but place it first.
+- TL;DR — at the VERY TOP, before weather, write a short summary paragraph (bold header "In brief"). This is a single flowing prose paragraph in ENGLISH that synthesizes ACROSS all the sections — it is the most valuable part, so surface cross-cutting things no single section sees on its own (e.g. an unread/starred email from someone I'm meeting today; a tight turnaround between two calendar events; a deadline due today; a market move that touches my holdings). Lead with the day's "shape" (busy/calm, any firm deadline), then the 2-4 things that actually matter. ALWAYS include it, but SCALE IT TO THE DAY: on a calm day keep it to one or two sentences ("Quiet day: nothing urgent, [one notable thing]. Nice weather."); on a busy day it can run 3-5 sentences. Don't pad a quiet day to sound eventful. Write it last (after you've seen all sections) but place it first.
 - Calendar — TWO subsections:
   • "Today": list EVERYTHING scheduled today, no exceptions — including routine/recurring items (work, classes, etc.). Today is complete.
   • "Coming up" (next 7 days): do NOT dump everything. Apply judgment — include what is actionable or notable: one-off events, appointments, meetings, deadlines, anything non-routine. FILTER OUT plain recurring routine (e.g. a daily "Bureau"/"Travail"/"Cours" block that repeats every weekday) — these add no signal on their own. BUT keep a routine item when it creates an interesting constraint or interacts with something else: e.g. work ends at 17:00 and there's a separate event at 17:30 (tight turnaround), an unusual start/end time, a day where the routine is absent when normally present, or a routine item butting up against another obligation. You infer what's "routine" from the title repeating across days and its regular hours — there's no explicit recurrence flag, so judge by the titles and times you see. When in doubt, INCLUDE rather than omit — err toward more, not less. If you drop routine items, you may add a brief note like "(routine work/class days hidden)" so I know they were there.
 - Inbox: START with the count line exactly as given (e.g. "47 emails total (6 unread)") as the first line of the section. THEN list each relevant email with sender (bold), subject, and one-line summary. Skip anything that looks like a newsletter or promo even if it slipped through. If there are no relevant emails, keep the count line and say the inbox has nothing needing attention.
 - À suivre (starred): these are emails I've starred as things to follow up on. Render each as a SINGLE actionable line capturing what I need to track — infer the action from sender/subject/snippet. Examples of the style: "Paiement à venir de [personne]", "Échéance pour l'envoi de [document]", "Réponse attendue à [personne] sur [sujet]". Keep each to one line, action-first. If there are none, omit this section entirely (don't show an empty header).
 - News: the news data is already organized by geographic bucket (Canada/Quebec, US, International, Business/markets) and may group several source links per story. Preserve that order and grouping. Render each story as a bullet; make every source link a clickable <a href> using the outlet name as the link text (e.g. "Globe", "NYT"). Keep multiple links on the same story inline. Do not reorder or merge the stories.
-- Weather: give a 2-line summary — current conditions and high/low — plus one sentence of advice if warranted (umbrella, layers, etc.).
+- Weather: give a 2-line summary — current conditions and high/low — plus one sentence of advice if warranted (umbrella, layers, etc.). IMPORTANT on rain: the data gives both a % chance AND the actual volume in mm. Judge by VOLUME, not just probability. Under ~1mm/3h is drizzle or a trace — describe it as "a chance of light rain" or "a few showers possible", NOT steady/continuous rain. Only call it real/steady rain at meaningful volumes (roughly 2mm+/3h). A high % chance with tiny mm means "might sprinkle", not "it will rain all day". Don't over-warn.
 - End with a short "⚡ Action items" section: a bullet list of anything from calendar or inbox that seems to require action today.
 - Keep the whole thing concise. Aim for something readable in under 2 minutes.
 """
