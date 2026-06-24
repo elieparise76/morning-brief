@@ -192,6 +192,38 @@ def fetch_emails() -> str:
         return f"Could not fetch emails: {e}"
 
 
+def fetch_starred() -> str:
+    """Fetch all starred emails (no time filter — stars are a persistent follow-up system)."""
+    try:
+        service = get_gmail_service()
+        # No "after:" filter — a star means "still to follow up", regardless of age.
+        results = service.users().messages().list(
+            userId="me", q="is:starred", maxResults=15,
+        ).execute()
+
+        messages = results.get("messages", [])
+        if not messages:
+            return "No starred emails."
+
+        starred_lines = []
+        for msg in messages:
+            detail = service.users().messages().get(
+                userId="me",
+                id=msg["id"],
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            ).execute()
+            headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+            sender = headers.get("From", "Unknown")
+            subject = headers.get("Subject", "(no subject)")
+            snippet = detail.get("snippet", "")[:150]
+            starred_lines.append(f"From: {sender}\nSubject: {subject}\nSnippet: {snippet}")
+
+        return "\n\n".join(starred_lines)
+    except Exception as e:
+        return f"Could not fetch starred emails: {e}"
+
+
 # ── Newsletter News ───────────────────────────────────────────────────────────
 class _TextExtractor(HTMLParser):
     """Strips HTML to plain text but keeps <a href> links inline as: text (url)."""
@@ -260,19 +292,15 @@ def _decode_email_body(payload) -> str:
 
 
 def fetch_news_from_newsletters(service) -> str:
-    """Find today's newsletters and have Claude pick top articles. Returns '' if none found."""
-    # Senders to pull newsletters from
-    sender_query = (
-        "from:globeandmail OR from:globeandmailnewsletters OR "
-        "from:economist.com OR from:nytimes OR from:nytdirect OR "
-        "from:theguardian.com"
-    )
-    # Only today's (last 18h to be safe, catches early-morning sends)
+    """Find today's News-labelled emails and have Claude pick top articles. Returns '' if none found."""
+    # Pull anything labelled "News" since 18:00 yesterday. The "after:" timestamp is applied
+    # together with the label, so even if the "News" label holds thousands of emails total,
+    # only the last ~13h are returned (a handful in practice). maxResults caps it regardless.
     since = int((datetime.datetime.now() - datetime.timedelta(hours=18)).timestamp())
-    query = f"({sender_query}) after:{since}"
+    query = f"label:News after:{since}"
 
     results = service.users().messages().list(
-        userId="me", q=query, maxResults=10,
+        userId="me", q=query, maxResults=15,
     ).execute()
     messages = results.get("messages", [])
 
@@ -384,7 +412,7 @@ def fetch_news() -> str:
 
 
 # ── Claude Call ───────────────────────────────────────────────────────────────
-def generate_brief(weather_data: str, calendar_data: str, email_data: str, news_data: str, today_str: str) -> str:
+def generate_brief(weather_data: str, calendar_data: str, email_data: str, starred_data: str, news_data: str, today_str: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     system = (
@@ -408,7 +436,10 @@ Here is the raw data. Produce my morning brief as clean HTML (no markdown) with 
 3. 📬 INBOX
 {email_data}
 
-4. 📰 NEWS
+4. ⭐ À SUIVRE (starred emails)
+{starred_data}
+
+5. 📰 NEWS
 {news_data}
 
 ---
@@ -417,8 +448,11 @@ FORMAT RULES:
 - Output ONLY valid HTML (no markdown, no backticks).
 - Use a clean, readable style with inline CSS. White background, dark text, max-width 600px.
 - Each section has a bold header with the emoji.
-- Calendar: list today's events first under "Today", then flag notable events in the next 7 days under "Coming up".
+- Calendar — TWO subsections:
+  • "Today": list EVERYTHING scheduled today, no exceptions — including routine/recurring items (work, classes, etc.). Today is complete.
+  • "Coming up" (next 7 days): do NOT dump everything. Apply judgment — include what is actionable or notable: one-off events, appointments, meetings, deadlines, anything non-routine. FILTER OUT plain recurring routine (e.g. a daily "Bureau"/"Travail"/"Cours" block that repeats every weekday) — these add no signal on their own. BUT keep a routine item when it creates an interesting constraint or interacts with something else: e.g. work ends at 17:00 and there's a separate event at 17:30 (tight turnaround), an unusual start/end time, a day where the routine is absent when normally present, or a routine item butting up against another obligation. You infer what's "routine" from the title repeating across days and its regular hours — there's no explicit recurrence flag, so judge by the titles and times you see. When in doubt, INCLUDE rather than omit — err toward more, not less. If you drop routine items, you may add a brief note like "(routine work/class days hidden)" so I know they were there.
 - Inbox: START with the count line exactly as given (e.g. "47 emails total (6 unread)") as the first line of the section. THEN list each relevant email with sender (bold), subject, and one-line summary. Skip anything that looks like a newsletter or promo even if it slipped through. If there are no relevant emails, keep the count line and say the inbox has nothing needing attention.
+- À suivre (starred): these are emails I've starred as things to follow up on. Render each as a SINGLE actionable line capturing what I need to track — infer the action from sender/subject/snippet. Examples of the style: "Paiement à venir de [personne]", "Échéance pour l'envoi de [document]", "Réponse attendue à [personne] sur [sujet]". Keep each to one line, action-first. If there are none, omit this section entirely (don't show an empty header).
 - News: the news data is already organized by geographic bucket (Canada/Quebec, US, International, Business/markets) and may group several source links per story. Preserve that order and grouping. Render each story as a bullet; make every source link a clickable <a href> using the outlet name as the link text (e.g. "Globe", "NYT"). Keep multiple links on the same story inline. Do not reorder or merge the stories.
 - Weather: give a 2-line summary — current conditions and high/low — plus one sentence of advice if warranted (umbrella, layers, etc.).
 - End with a short "⚡ Action items" section: a bullet list of anything from calendar or inbox that seems to require action today.
@@ -463,11 +497,14 @@ def main():
     print("Fetching emails...")
     emails = fetch_emails()
 
+    print("Fetching starred emails...")
+    starred = fetch_starred()
+
     print("Fetching news from newsletters...")
     news = fetch_news()
 
     print("Generating brief with Claude...")
-    html = generate_brief(weather, calendar, emails, news, today_str)
+    html = generate_brief(weather, calendar, emails, starred, news, today_str)
 
     print("Sending email...")
     gmail = get_gmail_service()
