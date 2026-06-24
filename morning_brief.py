@@ -423,7 +423,7 @@ def generate_brief(weather_data: str, calendar_data: str, email_data: str, starr
 
     prompt = f"""Today is {today_str}. I'm in Montréal, QC (America/Toronto timezone).
 
-Here is the raw data. Produce my morning brief as clean HTML (no markdown) with four sections:
+Here is the raw data. Produce my morning brief as clean HTML (no markdown). Start with a TL;DR summary at the very top, then the sections below.
 
 ---
 
@@ -448,6 +448,7 @@ FORMAT RULES:
 - Output ONLY valid HTML (no markdown, no backticks).
 - Use a clean, readable style with inline CSS. White background, dark text, max-width 600px.
 - Each section has a bold header with the emoji.
+- TL;DR — at the VERY TOP, before weather, write a short "En bref" paragraph (bold header "En bref"). This is a single flowing prose paragraph in FRENCH that synthesizes ACROSS all the sections — it is the most valuable part, so surface cross-cutting things no single section sees on its own (e.g. an unread/starred email from someone I'm meeting today; a tight turnaround between two calendar events; a deadline due today; a market move that touches my holdings). Lead with the day's "shape" (busy/calm, any firm deadline), then the 2-4 things that actually matter. ALWAYS include it, but SCALE IT TO THE DAY: on a calm day keep it to one or two sentences ("Journée tranquille : rien d'urgent, [one notable thing]. Beau temps."); on a busy day it can run 3-5 sentences. Don't pad a quiet day to sound eventful. Write it last (after you've seen all sections) but place it first.
 - Calendar — TWO subsections:
   • "Today": list EVERYTHING scheduled today, no exceptions — including routine/recurring items (work, classes, etc.). Today is complete.
   • "Coming up" (next 7 days): do NOT dump everything. Apply judgment — include what is actionable or notable: one-off events, appointments, meetings, deadlines, anything non-routine. FILTER OUT plain recurring routine (e.g. a daily "Bureau"/"Travail"/"Cours" block that repeats every weekday) — these add no signal on their own. BUT keep a routine item when it creates an interesting constraint or interacts with something else: e.g. work ends at 17:00 and there's a separate event at 17:30 (tight turnaround), an unusual start/end time, a day where the routine is absent when normally present, or a routine item butting up against another obligation. You infer what's "routine" from the title repeating across days and its regular hours — there's no explicit recurrence flag, so judge by the titles and times you see. When in doubt, INCLUDE rather than omit — err toward more, not less. If you drop routine items, you may add a brief note like "(routine work/class days hidden)" so I know they were there.
