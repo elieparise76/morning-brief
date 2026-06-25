@@ -234,17 +234,24 @@ def fetch_starred() -> str:
 
 # ── Newsletter News ───────────────────────────────────────────────────────────
 class _TextExtractor(HTMLParser):
-    """Strips HTML to plain text but keeps <a href> links inline as: text (url)."""
+    """Strips HTML to readable text. Keeps a link's URL ONLY if the link has real
+    anchor text — this drops the hundreds of bare image/icon/spacer tracking links
+    that otherwise eat the whole budget, while keeping meaningful article links."""
     def __init__(self):
         super().__init__()
         self.parts = []
         self._current_href = None
+        self._in_link = False
+        self._link_had_text = False
         self._skip = False
 
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style", "head"):
             self._skip = True
         if tag == "a":
+            self._current_href = None
+            self._in_link = True
+            self._link_had_text = False
             for name, val in attrs:
                 if name == "href":
                     self._current_href = val
@@ -252,11 +259,17 @@ class _TextExtractor(HTMLParser):
     def handle_endtag(self, tag):
         if tag in ("script", "style", "head"):
             self._skip = False
-        if tag == "a" and self._current_href:
-            self.parts.append(f" ({self._current_href})")
+        if tag == "a":
+            # Only emit the URL if the link actually had visible text (i.e. it's a
+            # real article link, not an image/icon/spacer). Also skip obvious
+            # boilerplate destinations.
+            if self._current_href and self._link_had_text and _is_useful_url(self._current_href):
+                self.parts.append(f" ({self._current_href})")
             self._current_href = None
+            self._in_link = False
+            self._link_had_text = False
         if tag in ("td", "th"):
-            self.parts.append(" | ")  # keep table cells separated (e.g. market data rows)
+            self.parts.append(" | ")
         if tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3"):
             self.parts.append("\n")
 
@@ -264,14 +277,37 @@ class _TextExtractor(HTMLParser):
         if not self._skip:
             text = data.strip()
             if text:
+                if self._in_link:
+                    self._link_had_text = True
                 self.parts.append(text + " ")
 
     def get_text(self):
         out = "".join(self.parts)
         out = html.unescape(out)
+        # Collapse runs of empty table-cell separators ("| | | |" -> "")
+        out = re.sub(r"(\s*\|\s*){2,}", " ", out)
+        out = re.sub(r"^\s*\|\s*$", "", out, flags=re.MULTILINE)
+        # Drop lines that are now just whitespace/separators
+        lines = [ln.rstrip() for ln in out.split("\n")]
+        lines = [ln for ln in lines if ln.strip() and ln.strip() != "|"]
+        out = "\n".join(lines)
         out = re.sub(r"\n{3,}", "\n\n", out)
         out = re.sub(r"[ \t]{2,}", " ", out)
         return out.strip()
+
+
+# Boilerplate destinations to drop even when they carry anchor text.
+_URL_BLOCKLIST = (
+    "unsubscribe", "/preferences", "privacy", "terms", "myaccount",
+    "manage-email", "email-preferences", "/app", "apps.apple", "play.google",
+    "facebook.com", "twitter.com", "x.com/", "instagram.com", "linkedin.com",
+    "tiktok.com", "youtube.com", "view-in-browser", "viewinbrowser", "/account",
+)
+
+
+def _is_useful_url(url: str) -> bool:
+    low = url.lower()
+    return not any(bad in low for bad in _URL_BLOCKLIST)
 
 
 def _decode_email_body(payload) -> str:
@@ -326,7 +362,7 @@ def fetch_news_from_newsletters(service) -> str:
         sender = headers.get("From", "Unknown")
         subject = headers.get("Subject", "(no subject)")
         body = _decode_email_body(detail["payload"])
-        body = body[:12000]  # cap to keep token cost sane
+        body = body[:25000]  # cap per newsletter (raised — extraction is now much denser after stripping link/cell noise)
         newsletters.append(f"=== From: {sender} | Subject: {subject} ===\n{body}")
 
     combined = "\n\n".join(newsletters)
