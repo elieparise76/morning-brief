@@ -8,20 +8,42 @@ This guide has two purposes:
 2. **Context handoff** — paste this whole file to Claude in a new chat if you need help
    and have lost the original conversation. It explains the entire architecture.
 
+*Last updated: June 2026, reflecting the label-based news, starred section, TL;DR,
+calendar filtering, weather-volume, and HTML-extraction changes.*
+
 ---
 
 ## 1. What this system does
 
-Every weekday at 7:30 AM, a cloud job runs and emails you a brief with four sections:
+Every weekday at 7:30 AM, a cloud job runs and emails you a brief. Current sections,
+in order:
 
-1. **🌤 Weather** — Montréal forecast (current conditions, high/low, advice).
-2. **📅 Calendar** — today's events + notable items in the next 7 days, pulled from
-   your primary calendar **plus two shared/subscribed calendars**.
-3. **📬 Inbox** — exact count of inbox emails (total + unread), then any relevant
+0. **In brief (TL;DR)** — a short English prose paragraph at the very top that
+   synthesizes ACROSS all sections (cross-cutting things no single section sees:
+   a starred email from someone you're meeting today, a tight turnaround between
+   events, a deadline due today, a market move touching your holdings). Scales to
+   the day: one line on a calm day, 3–5 sentences when busy.
+1. **🌤 Weather** — Montréal forecast (conditions, high/low, advice). Judges rain by
+   actual **volume in mm**, not just probability, so light drizzle isn't over-reported.
+2. **📅 Calendar** — TODAY shows everything; "Coming up" (next 7 days) filters out
+   plain routine (recurring work/class blocks) but keeps routine that creates an
+   interesting constraint (e.g. work ends 17:00, event at 17:30). Pulls primary +
+   shared/subscribed calendars. Bias: include rather than omit.
+3. **📬 Inbox** — exact count (total + unread via `labels.get`), then any relevant
    unread email from the last 24h (skipping newsletters/promos).
-4. **📰 News** — 5–10 curated stories. **Tries your newsletters first** (Globe and Mail,
-   NYT, Economist, Guardian); if none have arrived, **falls back to a web search**.
-   Selection is merit-based, with article links.
+4. **⭐ À suivre (starred)** — all starred emails (no time filter — a star means
+   "still to follow up"), each rendered as a single actionable line. Capped at 15.
+   Section is omitted entirely if there are none.
+5. **📰 News** — 5–10 *stories* (a story can bundle several source links). **Tries
+   your newsletters first** (emails labelled **"News"**); if none, **falls back to a
+   web search**. Assumes you already know the headlines — surfaces the *angle*, not
+   the recap, synthesizing specifics across outlets. Geographic balance target
+   ~25% each: Canada/Quebec, US, International (with explicit Asia inclusion),
+   Business/markets. Business bucket is protected (market data is wanted even if "known").
+6. **⚡ Action items** — bulleted to-dos pulled from calendar/inbox/starred.
+
+The whole brief is written in **English** (Claude's prose); proper nouns and event
+titles stay in their original language.
 
 ---
 
@@ -38,11 +60,11 @@ GitHub Actions  (.github/workflows/morning_brief.yml)
       ▼
 morning_brief.py
       │
-      ├─ OpenWeatherMap API  → weather
-      ├─ Google Calendar API → primary + 2 shared calendars
-      ├─ Gmail API           → inbox counts + relevant emails + newsletters
-      ├─ Anthropic API       → curates news + generates the final HTML brief
-      │                        (Claude Sonnet 4.6; web search only on fallback)
+      ├─ OpenWeatherMap API  → weather (incl. actual rain/snow mm volume)
+      ├─ Google Calendar API → primary + shared/subscribed calendars
+      ├─ Gmail API           → inbox counts + relevant emails + starred + "News"-labelled newsletters
+      ├─ Anthropic API       → curates news (own call) + generates the final HTML brief
+      │                        (Claude Sonnet 4.6; web search only on news fallback)
       ▼
 Gmail API (send) → emails the finished brief to you
       │
@@ -52,8 +74,12 @@ Your phone buzzes (Gmail push notification)
 
 **Why cron-job.org instead of GitHub's own schedule?** GitHub's cron is unreliable
 (runs late, sometimes skips). cron-job.org fires on time and supports real timezones,
-so it handles the daylight-saving switch for you. GitHub's `schedule:` block was
-removed to avoid duplicate runs (and duplicate API charges).
+so it handles the daylight-saving switch automatically.
+
+> **Note on triggers:** the workflow has BOTH a `repository_dispatch` trigger (fired by
+> cron-job.org — the primary) AND a backup GitHub `schedule:` cron (`30 11 * * 1-5`).
+> The two can both fire; cron-job.org is the reliable one. If you ever see duplicate
+> briefs, remove the `schedule:` block from the workflow.
 
 ---
 
@@ -63,7 +89,7 @@ removed to avoid duplicate runs (and duplicate API charges).
 |---|---|---|---|
 | **GitHub** | Hosts the code + runs the job (GitHub Actions) | github.com/elieparise76/morning-brief | Free |
 | **cron-job.org** | Triggers the job at 7:30 AM daily | cron-job.org | Free |
-| **Anthropic Console** | Claude API (news curation + brief generation) | console.anthropic.com | ~$0.50–2/month |
+| **Anthropic Console** | Claude API (news curation + brief generation) | console.anthropic.com | ~$1–4/month |
 | **OpenWeatherMap** | Weather data | openweathermap.org | Free tier |
 | **Google Cloud** | OAuth credentials for Gmail + Calendar | console.cloud.google.com | Free |
 
@@ -97,8 +123,11 @@ This is the part to actually keep track of.
 | **Google OAuth tokens** | Don't expire if used regularly | Would only break if unused 6+ months or you revoke access | Re-run `get_tokens.py` locally, update the two GitHub secrets |
 | **OpenWeatherMap key** | No expiry | — | — |
 
-> **Tip:** Set a calendar reminder ~3 days before the GitHub token's 90-day expiry.
-> Also enable a **spend alert** in Anthropic Console (Billing → set monthly limit +
+> **Reminder already set:** a recurring Google Calendar event "🔑 Renew GitHub token
+> (Morning Brief)" fires every 90 days, ~3 days before expiry, with the renewal steps
+> in its description.
+>
+> **Tip:** enable a **spend alert** in Anthropic Console (Billing → set monthly limit +
 > email alert) so you're warned before credits run out.
 
 ### 5a. Renewing the GitHub Personal Access Token (every 90 days)
@@ -125,14 +154,15 @@ This is the part to actually keep track of.
 ## 6. cron-job.org configuration (for reference)
 
 - **URL:** `https://api.github.com/repos/elieparise76/morning-brief/dispatches`
-  (note: **api.**github.com — a common mistake is omitting the `api.` prefix → 422 error)
+  (note: **api.**github.com — omitting the `api.` prefix → 422 error)
 - **Method:** POST
 - **Headers:**
   - `Accept: application/vnd.github+json`
   - `Authorization: Bearer <github token>`
   - `Content-Type: application/json`
 - **Body:** `{"event_type": "morning-brief"}`
-- **Schedule:** Mon–Fri, 7:30, timezone **America/Toronto**
+- **Schedule:** currently set 7-days-a-week, 7:30, timezone **America/Toronto**
+  (the workflow's backup cron is Mon–Fri only, but cron-job.org drives it daily)
 
 ---
 
@@ -141,20 +171,33 @@ This is the part to actually keep track of.
 | Setting | Current value | Where to change |
 |---|---|---|
 | Timezone | America/Toronto | `MONTREAL_TZ` constant near top |
-| Calendars | primary + 2 shared IDs | `calendar_ids` list in `fetch_calendar_events()` |
-| Newsletter senders | globeandmail, globeandmailnewsletters, economist.com, nytimes, nytdirect, theguardian.com | `sender_query` in `fetch_news_from_newsletters()` |
+| Calendars | primary + 3 shared IDs | `calendar_ids` list in `fetch_calendar_events()` |
+| News source | Gmail label **"News"** (replaced sender list) | `query` in `fetch_news_from_newsletters()` |
 | Newsletter lookback | last 18 hours | `since` in `fetch_news_from_newsletters()` |
+| Per-newsletter text cap | 25,000 chars | `body[:25000]` in `fetch_news_from_newsletters()` |
 | Inbox relevant-email lookback | last 24 hours | `since` in `fetch_emails()` |
-| News count target | 5–10 stories | prompts in the news functions |
+| Inbox counts | exact via `labels.get` on INBOX | `fetch_emails()` |
+| Starred cap | 15, no time filter | `fetch_starred()` |
+| News count target | 5–10 stories, ~25% per geo bucket | `news_prompt` in `fetch_news_from_newsletters()` |
 | Claude model | claude-sonnet-4-6 | all `client.messages.create()` calls |
-| Max tokens (main brief) | 4000 | `generate_brief()` |
-| Web search | fallback only | `fetch_news_from_web()` |
+| Max tokens (news call) | 4000 | `fetch_news_from_newsletters()` |
+| Max tokens (main brief) | 8000 | `generate_brief()` |
+| Language | English prose, original-language proper nouns | `system` string in `generate_brief()` |
+| Web search | fallback only (no newsletters) | `fetch_news_from_web()` |
 
-### The two shared calendar IDs
+### The shared calendar IDs (in addition to "primary")
 ```
 REMOVED_CALENDAR_ID
 REMOVED_CALENDAR_ID
+REMOVED_CALENDAR_ID
 ```
+
+### News HTML extraction (important)
+The `_TextExtractor` class strips newsletter HTML to text. Key behavior: it keeps a
+link's URL **only if the link has visible anchor text** (drops bare image/icon/spacer
+tracking links that otherwise eat the character budget), drops boilerplate URLs
+(unsubscribe, social, preferences — see `_URL_BLOCKLIST`), and collapses empty table
+cells. This is why the per-newsletter cap could be raised to 25k without ballooning cost.
 
 ---
 
@@ -166,9 +209,13 @@ REMOVED_CALENDAR_ID
 | cron-job.org | Free |
 | OpenWeatherMap | Free |
 | Google APIs | Free |
-| Anthropic — newsletter days | ~$0.03–0.05/run |
-| Anthropic — web-search fallback days | ~$0.05–0.10/run |
-| **Total** | **~$0.50–2.00/month** |
+| Anthropic — news call + main brief call (2 calls/run) | ~$0.05–0.15/run |
+| Anthropic — web-search fallback days | ~$0.05–0.10/run extra |
+| **Total** | **~$1–4/month** (depends on newsletter volume) |
+
+> Cost note: the news section and the main brief are **two separate Claude calls**.
+> Most additions to the brief fold into the existing main call (near-zero extra cost);
+> only adding NEW separate `messages.create()` calls materially moves the bill.
 
 ---
 
@@ -178,12 +225,15 @@ REMOVED_CALENDAR_ID
 |---|---|---|
 | No brief arrived at all | GitHub token expired (90 days) | Renew token, update cron-job.org (§5a) |
 | No brief, token is fine | Anthropic credits ran out | Top up in console |
-| Brief arrived but news is empty/web fallback when you had newsletters | Newsletter arrived after 7:30, or sender not matched | Widen lookback window, or add sender to `sender_query` |
-| 422 error in cron-job.org | URL missing `api.` prefix, or bad body | Check URL = `api.github.com/...`, body = `{"event_type":"morning-brief"}` |
+| News empty / web fallback when you had newsletters | Newsletter arrived after 7:30, OR not labelled "News" | Check the Gmail filter applies "News"; widen lookback |
+| News missing a bucket (e.g. business) | Content truncated or buried in link noise | Run `debug_news.py` to see what Claude receives; check the 25k cap and extraction |
+| 422 error in cron-job.org | URL missing `api.` prefix, or bad body | URL = `api.github.com/...`, body = `{"event_type":"morning-brief"}` |
 | 401/403 in cron-job.org | Token wrong or lacks Contents:write | Regenerate token with correct permission |
-| Calendar missing shared events | OAuth token can't see that calendar | Confirm calendar is subscribed at account level; check Actions log for "could not read calendar" warnings |
-| Email count looks wrong | (Fixed) — uses labels.get for exact INBOX counts | n/a |
-| `ServerToolUseBlock has no attribute text` | (Fixed) — code now collects only text blocks | n/a |
+| Calendar missing shared events | OAuth token can't see that calendar | Confirm subscribed at account level; check Actions log for "could not read calendar" warnings |
+| Brief cut off mid-HTML | Main brief hit token ceiling | Raise `max_tokens` in `generate_brief()` (currently 8000) |
+| Rain over-reported | (Fixed) — now judges by mm volume, not just % chance | n/a |
+| Email count wrong | (Fixed) — uses `labels.get` for exact INBOX counts | n/a |
+| `ServerToolUseBlock has no attribute text` | (Fixed) — code collects text blocks by `hasattr` | n/a |
 
 ---
 
@@ -191,8 +241,9 @@ REMOVED_CALENDAR_ID
 
 ```
 morning-brief/
-├── .github/workflows/morning_brief.yml   ← workflow (repository_dispatch trigger)
+├── .github/workflows/morning_brief.yml   ← workflow (repository_dispatch + backup cron)
 ├── morning_brief.py                       ← main script (all logic)
+├── debug_news.py                          ← diagnostic: dumps the raw news text Claude receives
 ├── get_tokens.py                          ← one-time Google auth helper (run locally, do NOT commit)
 ├── .gitignore                             ← keeps token files out of the repo
 ├── README.md                              ← original setup guide
@@ -205,12 +256,28 @@ morning-brief/
 ## 11. For Claude (context handoff)
 
 If Élie is pasting this to you in a new chat: this is a working serverless morning-brief
-system. The architecture is in §2, the code lives in `morning_brief.py` (single file, all
-functions: `fetch_weather`, `fetch_calendar_events`, `fetch_emails`, `fetch_news` +
-`fetch_news_from_newsletters` + `fetch_news_from_web`, `generate_brief`, `send_email`,
-`main`). It uses Google OAuth tokens (refresh-token based), the Anthropic API
-(Sonnet 4.6, web search on fallback only), OpenWeatherMap, GitHub Actions triggered by
-cron-job.org via `repository_dispatch`. Known prior fixes: inbox counts use `labels.get`
-(not resultSizeEstimate); web-search responses must collect text blocks by `hasattr(b,
-"text")` not `content[0].text`; main brief uses `max_tokens=4000` to avoid truncation.
-Ask to see the current `morning_brief.py` before editing, since Élie may have changed it.
+system. Architecture in §2; all logic is in `morning_brief.py` (single file). Key
+functions: `fetch_weather` (includes rain/snow mm volume), `fetch_calendar_events`
+(primary + shared calendars, with a today-vs-coming-up routine filter applied in the
+main prompt), `fetch_emails` (exact counts via `labels.get`), `fetch_starred`,
+`fetch_news` → `fetch_news_from_newsletters` (pulls Gmail label "News", extracts via
+`_TextExtractor`, caps 25k/newsletter, own Claude call, `max_tokens=4000`) +
+`fetch_news_from_web` (web-search fallback), `generate_brief` (main HTML call,
+`max_tokens=8000`, English prose), `send_email`, `main`.
+
+Known prior fixes (do NOT regress these):
+- Inbox counts use `labels.get` on INBOX, not `resultSizeEstimate`.
+- Web-search responses collect text blocks via `hasattr(b, "text")`, not `content[0].text`.
+- News selection: business bucket is explicitly protected; geographic balance ~25%/bucket
+  with Asia called out; "give me the angle not the headline" applies LESS to markets.
+- Weather judged by mm volume, not just % chance.
+- `_TextExtractor` keeps URLs only for links with anchor text + a `_URL_BLOCKLIST`;
+  this is what keeps the 25k cap affordable. Don't revert to keeping all links.
+- TL;DR ("In brief") and the whole brief are produced in ONE main call (Tier A cost) —
+  don't split into extra calls without reason.
+
+There are TWO Claude calls per run (news curation + main brief). Ask to see the current
+`morning_brief.py` before editing — Élie iterates on it frequently.
+
+A diagnostic script `debug_news.py` dumps exactly what Claude receives as news (run it
+locally with the Gmail token) — use it whenever the news section misbehaves.
