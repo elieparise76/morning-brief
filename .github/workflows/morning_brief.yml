@@ -1,11 +1,11 @@
 name: Morning Brief
 
 on:
-  schedule:
+   # schedule:
     # Backup trigger (GitHub's own cron — unreliable, may run late or be skipped).
     # 7:30 AM EDT = 11:30 UTC (summer) / change to 12:30 UTC for EST (winter).
     # Runs 7 days a week now (weekend + Sunday editions are handled in the script).
-    - cron: '30 11 * * *'
+    # - cron: '30 11 * * *'
   repository_dispatch:
     # Primary trigger — fired by cron-job.org at exactly 7:30 AM ET.
     types: [morning-brief]
