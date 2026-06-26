@@ -56,20 +56,51 @@ def get_calendar_service():
 
 
 # ── Data Fetchers ─────────────────────────────────────────────────────────────
-def fetch_weather() -> str:
-    """Fetch current weather for Montréal via OpenWeatherMap."""
+def fetch_weather(mode: str = "today") -> str:
+    """Fetch Montréal weather via OpenWeatherMap.
+    mode='today': next ~24h in 3h steps (detailed).
+    mode='week': the full 5-day forecast, summarized per day (for the Sunday edition)."""
     if not OPENWEATHER_API_KEY:
         return "Weather API key not configured."
+
+    # 'today' pulls 8 x 3h slices (~24h); 'week' pulls the full 40-slice 5-day forecast.
+    cnt = 8 if mode == "today" else 40
     url = (
         f"https://api.openweathermap.org/data/2.5/forecast"
-        f"?q=Montreal,CA&appid={OPENWEATHER_API_KEY}&units=metric&cnt=8"
+        f"?q=Montreal,CA&appid={OPENWEATHER_API_KEY}&units=metric&cnt={cnt}"
     )
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
         items = data["list"]
-        # Current + today range
+
+        if mode == "week":
+            # Group slices by calendar day; report each day's min/max temp, total rain,
+            # and the dominant condition. Gives Claude enough to write a week-ahead line.
+            from collections import defaultdict
+            days = defaultdict(lambda: {"temps": [], "rain": 0.0, "snow": 0.0, "descs": []})
+            for item in items:
+                dt = datetime.datetime.fromtimestamp(item["dt"], tz=MONTREAL_TZ)
+                key = dt.strftime("%A %b %d")
+                days[key]["temps"].append(item["main"]["temp"])
+                days[key]["rain"] += item.get("rain", {}).get("3h", 0)
+                days[key]["snow"] += item.get("snow", {}).get("3h", 0)
+                days[key]["descs"].append(item["weather"][0]["description"])
+            lines = []
+            for day, d in days.items():
+                lo, hi = min(d["temps"]), max(d["temps"])
+                # most common description that day
+                dominant = max(set(d["descs"]), key=d["descs"].count)
+                precip = ""
+                if d["rain"]:
+                    precip += f", total rain {d['rain']:.1f}mm"
+                if d["snow"]:
+                    precip += f", total snow {d['snow']:.1f}mm"
+                lines.append(f"{day}: {dominant}, {lo:.0f}–{hi:.0f}°C{precip}")
+            return "\n".join(lines)
+
+        # mode == "today": detailed 3h slices
         lines = []
         for item in items:
             dt = datetime.datetime.fromtimestamp(item["dt"], tz=MONTREAL_TZ)
@@ -78,7 +109,6 @@ def fetch_weather() -> str:
             feels = item["main"]["feels_like"]
             wind = item["wind"]["speed"]
             pop = item.get("pop", 0) * 100
-            # Actual precipitation VOLUME in mm over the 3h window (not just probability).
             rain_mm = item.get("rain", {}).get("3h", 0)
             snow_mm = item.get("snow", {}).get("3h", 0)
             precip = ""
@@ -95,17 +125,22 @@ def fetch_weather() -> str:
         return f"Could not fetch weather: {e}"
 
 
-def fetch_calendar_events() -> str:
-    """Fetch today's events + next 7 days from primary + subscribed calendars."""
+
+def fetch_calendar_events(start_offset_days: int = 0, end_offset_days: int = 8) -> str:
+    """Fetch events from [today+start_offset, today+end_offset) across all calendars.
+    Default: today through next 7 days. start_offset_days=1 skips today entirely."""
     try:
         service = get_calendar_service()
         now_et = datetime.datetime.now(MONTREAL_TZ)
-        today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_end = today_start + datetime.timedelta(days=8)
+        midnight = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+        window_start = midnight + datetime.timedelta(days=start_offset_days)
+        window_end = midnight + datetime.timedelta(days=end_offset_days)
+        today_start = window_start  # name kept for downstream references
 
-        # Calendars to check: primary + the two shared/subscribed ones
+        # Calendars to check: primary + the shared/subscribed ones
         calendar_ids = [
             "primary",
+            "REMOVED_CALENDAR_ID",
             "REMOVED_CALENDAR_ID",
             "REMOVED_CALENDAR_ID",
         ]
@@ -115,8 +150,8 @@ def fetch_calendar_events() -> str:
             try:
                 events_result = service.events().list(
                     calendarId=cal_id,
-                    timeMin=today_start.isoformat(),
-                    timeMax=week_end.isoformat(),
+                    timeMin=window_start.isoformat(),
+                    timeMax=window_end.isoformat(),
                     singleEvents=True,
                     orderBy="startTime",
                     maxResults=50,
@@ -337,8 +372,9 @@ def _decode_email_body(payload) -> str:
     return body_text.strip()
 
 
-def fetch_news_from_newsletters(service) -> str:
-    """Find today's News-labelled emails and have Claude pick top articles. Returns '' if none found."""
+def fetch_news_from_newsletters(service, news_length: str = "normal") -> str:
+    """Find today's News-labelled emails and have Claude pick top articles. Returns '' if none found.
+    news_length: 'short' (~3-5 stories), 'normal' (~5-10), 'long' (~10-15)."""
     # Pull anything labelled "News" since 18:00 yesterday. The "after:" timestamp is applied
     # together with the label, so even if the "News" label holds thousands of emails total,
     # only the last ~13h are returned (a handful in practice). maxResults caps it regardless.
@@ -367,6 +403,14 @@ def fetch_news_from_newsletters(service) -> str:
 
     combined = "\n\n".join(newsletters)
 
+    # Story-count target varies by edition (weekend = longer, Sunday = shorter).
+    count_targets = {
+        "short": "Aim for 3-5 STORIES (not articles — one story can bundle several links).",
+        "normal": "Aim for 5-10 STORIES (not articles — one story can bundle several links). It's fine to exceed 10 links total if the stories warrant it.",
+        "long": "Aim for 10-15 STORIES (not articles — one story can bundle several links). This is a weekend edition, so go deeper — include more analysis, more opinion pieces matching my interests, and more of the second-tier stories you'd normally cut. It's fine to exceed 15 links total.",
+    }
+    count_line = count_targets.get(news_length, count_targets["normal"])
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     news_prompt = f"""Below are the raw contents of this morning's news newsletters from my inbox (Globe and Mail, Economist, NYT, Guardian).
 
@@ -380,7 +424,7 @@ HOW TO HANDLE EACH STORY:
 - Group all coverage of the same event into a SINGLE story, even if 3 outlets cover it. A story can carry multiple links.
 
 SELECTION:
-- Aim for 5-10 STORIES (not articles — one story can bundle several links). It's fine to exceed 10 links total if the stories warrant it.
+- {count_line}
 - Target a rough balance across these four buckets (~25% each). It's a guide, not a hard quota — BUT if a bucket has source material in the newsletters, you MUST represent it. Never silently drop a whole bucket that has content available. Only let a bucket be thin if the newsletters genuinely contain little/nothing for it that morning. The business/markets bucket in particular is frequently under-filled — actively check for a markets/business newsletter and pull from it.
   • 🇨🇦 Canada / Quebec (~25%)
   • 🇺🇸 United States (~25%)
@@ -414,22 +458,25 @@ Newsletters:
     return text.strip()
 
 
-def fetch_news_from_web() -> str:
+def fetch_news_from_web(news_length: str = "normal") -> str:
     """Fallback: web search for top stories when no newsletters are available."""
+    counts = {"short": "3-5", "normal": "5-10", "long": "10-15"}
+    n = counts.get(news_length, "5-10")
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    web_prompt = """Search the web for the most significant news from the last 24 hours. Cover three areas:
+    web_prompt = f"""Search the web for the most significant news from the last 24 hours. Cover four areas:
 - 🇨🇦 Canada/Quebec: federal politics, Quebec politics, major policy or legal developments.
-- 🌍 International: significant geopolitical events, elections, conflicts, major diplomatic moves.
-- 📈 Financial: markets, central bank moves, major corporate news, macro developments.
+- 🇺🇸 United States: federal politics, constitutional debates, notable policy.
+- 🌍 International: significant geopolitical events, elections, conflicts, major diplomatic moves (include Asia, not just Europe).
+- 📈 Business/markets: index moves, central bank moves, major corporate news, macro developments.
 
-Give 5-10 stories total. For each: a one-sentence summary followed by a source link.
+Give {n} stories total, roughly balanced across the four areas. For each: a one-sentence summary followed by a source link.
 Return plain text only (no HTML, no markdown headers). Format each item as:
 • [summary] — [url]
 Skip fluff — only genuinely significant developments."""
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1500,
+        max_tokens=2500,
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[{"role": "user", "content": web_prompt}],
     )
@@ -438,27 +485,56 @@ Skip fluff — only genuinely significant developments."""
     return "\n".join(text_parts).strip() or "News unavailable."
 
 
-def fetch_news() -> str:
+def fetch_news(news_length: str = "normal") -> str:
     """Try newsletters first; fall back to web search if none are found."""
     try:
         service = get_gmail_service()
-        newsletter_news = fetch_news_from_newsletters(service)
+        newsletter_news = fetch_news_from_newsletters(service, news_length=news_length)
         if newsletter_news:
             return newsletter_news + "\n\n(Source: your morning newsletters)"
         # No newsletters today → web fallback
-        web_news = fetch_news_from_web()
+        web_news = fetch_news_from_web(news_length=news_length)
         return web_news + "\n\n(Source: web search — no newsletters found this morning)"
     except Exception as e:
         # If newsletters fail for any reason, still try the web before giving up
         try:
-            web_news = fetch_news_from_web()
+            web_news = fetch_news_from_web(news_length=news_length)
             return web_news + "\n\n(Source: web search fallback)"
         except Exception as e2:
             return f"Could not fetch news: {e} / {e2}"
 
 
 # ── Claude Call ───────────────────────────────────────────────────────────────
-def generate_brief(weather_data: str, calendar_data: str, email_data: str, starred_data: str, news_data: str, today_str: str) -> str:
+
+# Reusable format-rule fragments, keyed by section. Only the rules for sections
+# actually present in the brief get included in the prompt.
+_RULE_TLDR = '- TL;DR — at the VERY TOP, write a short summary paragraph (bold header "In brief"). A single flowing prose paragraph in ENGLISH that synthesizes ACROSS all the sections present — surface cross-cutting things no single section sees on its own (e.g. a starred email from someone I\'m meeting; a tight turnaround between two events; a deadline; a market move touching my holdings). Lead with the day\'s/period\'s "shape", then the 2-4 things that matter. ALWAYS include it, scaled to how much is going on: one or two sentences when quiet, 3-5 when busy. Don\'t pad. Write it last but place it first.'
+
+_RULE_WEATHER_TODAY = '- Weather: 2-line summary — current conditions and high/low — plus one sentence of advice if warranted. IMPORTANT on rain: the data gives a % chance AND the actual mm volume. Judge by VOLUME, not probability. Under ~1mm/3h is drizzle/trace — say "a chance of light rain", NOT steady rain. Only call it real rain at ~2mm+/3h. High % with tiny mm = "might sprinkle". Don\'t over-warn.'
+
+_RULE_WEATHER_WEEK = '- Weather (week ahead): the data is a per-day forecast for the next ~5 days. Give a SHORT week-ahead outlook — the general trend (warming/cooling), and call out any specific days with notable rain, storms, or temperature swings. 2-4 lines total. Judge rain by mm volume, not just description. This replaces the usual daily weather since it\'s the start-of-week edition.'
+
+_RULE_CALENDAR_FULL = '''- Calendar — TWO subsections:
+  • "Today": list EVERYTHING scheduled today, no exceptions — including routine/recurring items. Today is complete.
+  • "Coming up" (next 7 days): do NOT dump everything. Include what is actionable or notable (one-off events, appointments, deadlines). FILTER OUT plain recurring routine (a daily "Bureau"/"Travail"/"Cours" block) — but KEEP a routine item when it creates an interesting constraint (work ends 17:00 and an event at 17:30; an unusual time; routine absent when normally present). Infer "routine" from repeated titles/hours. When in doubt, INCLUDE. If you drop routine items, add a brief note like "(routine work/class days hidden)".'''
+
+_RULE_CALENDAR_WEEKEND = '- Calendar (weekend): list everything scheduled for this weekend (today + the rest of the weekend). This is the weekend edition — show it all, no routine filtering needed, weekends are rarely routine.'
+
+_RULE_CALENDAR_WEEKAHEAD = '''- Calendar (week ahead): there is NO "today" section in this edition. Show the 5 upcoming weekdays (Mon-Fri). Apply the usual routine filter: include one-off events, appointments, deadlines, and any routine that creates an interesting constraint; filter out plain recurring routine blocks (note "(routine work/class days hidden)" if you drop them). This is the start-of-week planning view — help me see what the week holds.'''
+
+_RULE_INBOX = '- Inbox: START with the count line exactly as given (e.g. "47 emails total (6 unread)"). THEN list each relevant email with sender (bold), subject, one-line summary. Skip newsletters/promos. If none relevant, keep the count line and say the inbox has nothing needing attention.'
+
+_RULE_STARRED = '- À suivre (starred): emails I\'ve starred as follow-ups. Render each as a SINGLE actionable line capturing what to track — infer the action from sender/subject/snippet (e.g. "Paiement à venir de [personne]", "Échéance pour l\'envoi de [document]"). One line each, action-first. If none, omit this section entirely.'
+
+_RULE_NEWS = '- News: the data is organized by geographic bucket (Canada/Quebec, US, International, Business/markets) and may group several source links per story. Preserve that order and grouping. Render each story as a bullet; make every source link a clickable <a href> using the outlet name as link text (e.g. "Globe", "NYT"). Keep multiple links on a story inline. Do not reorder or merge stories.'
+
+_RULE_ACTION_ITEMS = '- End with a short "⚡ Action items" section: a bullet list of anything from calendar/inbox/starred that seems to require action.'
+
+
+def generate_brief(sections: dict, today_str: str, edition_note: str = "") -> str:
+    """Assemble and send the main brief prompt from whichever sections are present.
+    `sections` maps a section key -> its raw data string. Missing keys are omitted
+    entirely (data not fetched + rule not included + header not shown)."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     system = (
@@ -468,46 +544,60 @@ def generate_brief(weather_data: str, calendar_data: str, email_data: str, starr
         "Write the ENTIRE brief in English (section headers, summaries, everything). "
         "Keep proper nouns and event titles in their original language as they appear "
         "in the data (e.g. a calendar event 'Souper entre chéris' stays as is), but all "
-        "of your own prose — headers, the TL;DR, summaries, advice — must be in English."
+        "of your own prose — headers, the TL;DR, summaries, advice — must be in English. "
+        "Only include sections for the data you are given; do not invent sections."
     )
 
-    prompt = f"""Today is {today_str}. I'm in Montréal, QC (America/Toronto timezone).
+    # Map each possible section to (emoji header, the format rule to include).
+    section_meta = {
+        "weather":        ("🌤 WEATHER", None),       # rule chosen separately (today vs week)
+        "calendar":       ("📅 CALENDAR", None),       # rule chosen separately
+        "inbox":          ("📬 INBOX", _RULE_INBOX),
+        "starred":        ("⭐ À SUIVRE (starred emails)", _RULE_STARRED),
+        "news":           ("📰 NEWS", _RULE_NEWS),
+    }
 
-Here is the raw data. Produce my morning brief as clean HTML (no markdown). Start with a TL;DR summary at the very top, then the sections below.
+    # Build the data block (only present sections) and collect the rules to include.
+    data_blocks = []
+    rules = [_RULE_TLDR]
+    n = 1
+    for key in ["weather", "calendar", "inbox", "starred", "news"]:
+        if key not in sections:
+            continue
+        header, rule = section_meta[key]
+        data_blocks.append(f"{n}. {header}\n{sections[key]}")
+        n += 1
+        # Weather and calendar pick a variant rule passed in via sections meta.
+        if key == "weather":
+            rules.append(sections.get("_weather_rule", _RULE_WEATHER_TODAY))
+        elif key == "calendar":
+            rules.append(sections.get("_calendar_rule", _RULE_CALENDAR_FULL))
+        elif rule:
+            rules.append(rule)
+    rules.append(_RULE_ACTION_ITEMS)
+
+    data_section = "\n\n".join(data_blocks)
+    rules_section = "\n".join([
+        "- Output ONLY valid HTML (no markdown, no backticks).",
+        "- Use a clean, readable style with inline CSS. White background, dark text, max-width 600px.",
+        "- Each section has a bold header with the emoji.",
+        *rules,
+        "- Keep the whole thing concise and scannable.",
+    ])
+
+    note_line = f"\n{edition_note}\n" if edition_note else ""
+
+    prompt = f"""Today is {today_str}. I'm in Montréal, QC (America/Toronto timezone).{note_line}
+Here is the raw data. Produce my brief as clean HTML (no markdown). Start with the TL;DR at the very top, then the sections below.
 
 ---
 
-1. 🌤 WEATHER
-{weather_data}
-
-2. 📅 CALENDAR
-{calendar_data}
-
-3. 📬 INBOX
-{email_data}
-
-4. ⭐ À SUIVRE (starred emails)
-{starred_data}
-
-5. 📰 NEWS
-{news_data}
+{data_section}
 
 ---
 
 FORMAT RULES:
-- Output ONLY valid HTML (no markdown, no backticks).
-- Use a clean, readable style with inline CSS. White background, dark text, max-width 600px.
-- Each section has a bold header with the emoji.
-- TL;DR — at the VERY TOP, before weather, write a short summary paragraph (bold header "In brief"). This is a single flowing prose paragraph in ENGLISH that synthesizes ACROSS all the sections — it is the most valuable part, so surface cross-cutting things no single section sees on its own (e.g. an unread/starred email from someone I'm meeting today; a tight turnaround between two calendar events; a deadline due today; a market move that touches my holdings). Lead with the day's "shape" (busy/calm, any firm deadline), then the 2-4 things that actually matter. ALWAYS include it, but SCALE IT TO THE DAY: on a calm day keep it to one or two sentences ("Quiet day: nothing urgent, [one notable thing]. Nice weather."); on a busy day it can run 3-5 sentences. Don't pad a quiet day to sound eventful. Write it last (after you've seen all sections) but place it first.
-- Calendar — TWO subsections:
-  • "Today": list EVERYTHING scheduled today, no exceptions — including routine/recurring items (work, classes, etc.). Today is complete.
-  • "Coming up" (next 7 days): do NOT dump everything. Apply judgment — include what is actionable or notable: one-off events, appointments, meetings, deadlines, anything non-routine. FILTER OUT plain recurring routine (e.g. a daily "Bureau"/"Travail"/"Cours" block that repeats every weekday) — these add no signal on their own. BUT keep a routine item when it creates an interesting constraint or interacts with something else: e.g. work ends at 17:00 and there's a separate event at 17:30 (tight turnaround), an unusual start/end time, a day where the routine is absent when normally present, or a routine item butting up against another obligation. You infer what's "routine" from the title repeating across days and its regular hours — there's no explicit recurrence flag, so judge by the titles and times you see. When in doubt, INCLUDE rather than omit — err toward more, not less. If you drop routine items, you may add a brief note like "(routine work/class days hidden)" so I know they were there.
-- Inbox: START with the count line exactly as given (e.g. "47 emails total (6 unread)") as the first line of the section. THEN list each relevant email with sender (bold), subject, and one-line summary. Skip anything that looks like a newsletter or promo even if it slipped through. If there are no relevant emails, keep the count line and say the inbox has nothing needing attention.
-- À suivre (starred): these are emails I've starred as things to follow up on. Render each as a SINGLE actionable line capturing what I need to track — infer the action from sender/subject/snippet. Examples of the style: "Paiement à venir de [personne]", "Échéance pour l'envoi de [document]", "Réponse attendue à [personne] sur [sujet]". Keep each to one line, action-first. If there are none, omit this section entirely (don't show an empty header).
-- News: the news data is already organized by geographic bucket (Canada/Quebec, US, International, Business/markets) and may group several source links per story. Preserve that order and grouping. Render each story as a bullet; make every source link a clickable <a href> using the outlet name as the link text (e.g. "Globe", "NYT"). Keep multiple links on the same story inline. Do not reorder or merge the stories.
-- Weather: give a 2-line summary — current conditions and high/low — plus one sentence of advice if warranted (umbrella, layers, etc.). IMPORTANT on rain: the data gives both a % chance AND the actual volume in mm. Judge by VOLUME, not just probability. Under ~1mm/3h is drizzle or a trace — describe it as "a chance of light rain" or "a few showers possible", NOT steady/continuous rain. Only call it real/steady rain at meaningful volumes (roughly 2mm+/3h). A high % chance with tiny mm means "might sprinkle", not "it will rain all day". Don't over-warn.
-- End with a short "⚡ Action items" section: a bullet list of anything from calendar or inbox that seems to require action today.
-- Keep the whole thing concise. Aim for something readable in under 2 minutes.
+{rules_section}
 """
 
     message = client.messages.create(
@@ -534,28 +624,94 @@ def send_email(service, html_body: str, subject: str):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def get_edition(now_et):
+    """Pick the edition based on the weekday. Returns (name, config dict)."""
+    weekday = now_et.weekday()  # Mon=0 .. Sat=5, Sun=6
+
+    if weekday == 5:  # Saturday — weekend edition
+        # Calendar window: today (Sat) through end of Sunday = 2 days.
+        return "weekend", {
+            "weather": "today",
+            "calendar": ("weekend", 0, 2),   # (rule, start_offset, end_offset)
+            "inbox": False,                   # no inbox on Saturday
+            "starred": True,                  # starred only
+            "news": "long",
+        }
+
+    if weekday == 6:  # Sunday — start-of-week edition
+        # Calendar: skip today (Sun), show the next 5 days = Mon..Fri.
+        # start_offset=1 (tomorrow), end_offset=6 (through Fri inclusive).
+        return "week-ahead", {
+            "weather": "week",
+            "calendar": ("weekahead", 1, 6),
+            "inbox": True,                    # full inbox like normal
+            "starred": True,
+            "news": "short",
+        }
+
+    # Mon-Fri — standard edition
+    return "weekday", {
+        "weather": "today",
+        "calendar": ("full", 0, 8),           # today + next 7 days
+        "inbox": True,
+        "starred": True,
+        "news": "normal",
+    }
+
+
 def main():
     now_et = datetime.datetime.now(MONTREAL_TZ)
     today_str = now_et.strftime("%A, %B %d, %Y")
-    subject = f"☀️ Morning Brief — {today_str}"
+    edition_name, cfg = get_edition(now_et)
+    print(f"Edition: {edition_name}")
 
+    subject_prefix = {
+        "weekend": "🌅 Weekend Brief",
+        "week-ahead": "📆 Week Ahead",
+        "weekday": "☀️ Morning Brief",
+    }[edition_name]
+    subject = f"{subject_prefix} — {today_str}"
+
+    edition_notes = {
+        "weekend": "This is the WEEKEND edition: weekend calendar only, no inbox section (starred follow-ups only), and a longer/deeper news section.",
+        "week-ahead": "This is the START-OF-WEEK edition (Sunday): no 'today' — a week-ahead calendar (Mon-Fri) and a week-ahead weather outlook, normal inbox, shorter news.",
+        "weekday": "",
+    }
+    edition_note = edition_notes[edition_name]
+
+    sections = {}
+
+    # Weather
     print("Fetching weather...")
-    weather = fetch_weather()
+    sections["weather"] = fetch_weather(mode=cfg["weather"])
+    sections["_weather_rule"] = _RULE_WEATHER_WEEK if cfg["weather"] == "week" else _RULE_WEATHER_TODAY
 
+    # Calendar
     print("Fetching calendar...")
-    calendar = fetch_calendar_events()
+    cal_rule_key, start_off, end_off = cfg["calendar"]
+    sections["calendar"] = fetch_calendar_events(start_offset_days=start_off, end_offset_days=end_off)
+    sections["_calendar_rule"] = {
+        "full": _RULE_CALENDAR_FULL,
+        "weekend": _RULE_CALENDAR_WEEKEND,
+        "weekahead": _RULE_CALENDAR_WEEKAHEAD,
+    }[cal_rule_key]
 
-    print("Fetching emails...")
-    emails = fetch_emails()
+    # Inbox (optional)
+    if cfg["inbox"]:
+        print("Fetching emails...")
+        sections["inbox"] = fetch_emails()
 
-    print("Fetching starred emails...")
-    starred = fetch_starred()
+    # Starred (optional)
+    if cfg["starred"]:
+        print("Fetching starred emails...")
+        sections["starred"] = fetch_starred()
 
-    print("Fetching news from newsletters...")
-    news = fetch_news()
+    # News
+    print(f"Fetching news ({cfg['news']})...")
+    sections["news"] = fetch_news(news_length=cfg["news"])
 
     print("Generating brief with Claude...")
-    html = generate_brief(weather, calendar, emails, starred, news, today_str)
+    html = generate_brief(sections, today_str, edition_note=edition_note)
 
     print("Sending email...")
     gmail = get_gmail_service()
