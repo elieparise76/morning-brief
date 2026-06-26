@@ -206,7 +206,7 @@ def fetch_emails() -> str:
 
         # Relevant unread from last 24h (skipping promos/social/updates/newsletters)
         since = int((datetime.datetime.now() - datetime.timedelta(hours=24)).timestamp())
-        query = f"is:unread after:{since} -category:promotions -category:social -category:updates -label:newsletters"
+        query = f"is:unread after:{since} -category:promotions -category:social -category:updates -label:newsletters -label:News"
 
         results = service.users().messages().list(
             userId="me", q=query, maxResults=30,
@@ -382,7 +382,7 @@ def fetch_news_from_newsletters(service, news_length: str = "normal") -> str:
     query = f"label:News after:{since}"
 
     results = service.users().messages().list(
-        userId="me", q=query, maxResults=15,
+        userId="me", q=query, maxResults=6,
     ).execute()
     messages = results.get("messages", [])
 
@@ -398,7 +398,7 @@ def fetch_news_from_newsletters(service, news_length: str = "normal") -> str:
         sender = headers.get("From", "Unknown")
         subject = headers.get("Subject", "(no subject)")
         body = _decode_email_body(detail["payload"])
-        body = body[:25000]  # cap per newsletter (raised — extraction is now much denser after stripping link/cell noise)
+        body = body[:15000]  # cap per newsletter (raised — extraction is now much denser after stripping link/cell noise)
         newsletters.append(f"=== From: {sender} | Subject: {subject} ===\n{body}")
 
     combined = "\n\n".join(newsletters)
