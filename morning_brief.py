@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Morning Brief — Élie
-Runs via GitHub Actions at 7:30 AM ET on weekdays.
+Morning Brief — a serverless daily brief delivered by email.
+Runs via GitHub Actions, triggered by cron-job.org at 7:30 AM local time.
 Pulls weather, calendar, Gmail, and news via Claude + APIs, then emails the result.
+
+Personal settings (name, city, calendars, interests) live in config.py, which is
+git-ignored. Copy config.example.py to config.py and fill it in before running.
 """
 
 import os
@@ -21,11 +24,21 @@ import anthropic
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+try:
+    import config
+except ModuleNotFoundError:
+    raise SystemExit(
+        "Missing config.py. Copy config.example.py to config.py and fill in your "
+        "personal settings (name, city, calendar IDs, interests)."
+    )
+
 # ── Config ────────────────────────────────────────────────────────────────────
-MONTREAL_TZ = pytz.timezone("America/Toronto")
+LOCAL_TZ = pytz.timezone(config.TIMEZONE)
+MONTREAL_TZ = LOCAL_TZ  # backward-compatible alias used throughout the file
 OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
+# Recipient: env var (GitHub secret) wins; otherwise fall back to config.
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL") or config.RECIPIENT_EMAIL_FALLBACK
 
 
 # ── Google Auth ───────────────────────────────────────────────────────────────
@@ -57,7 +70,7 @@ def get_calendar_service():
 
 # ── Data Fetchers ─────────────────────────────────────────────────────────────
 def fetch_weather(mode: str = "today") -> str:
-    """Fetch Montréal weather via OpenWeatherMap.
+    """Fetch local weather via OpenWeatherMap (city from config).
     mode='today': next ~24h in 3h steps (detailed).
     mode='week': the full 5-day forecast, summarized per day (for the Sunday edition)."""
     if not OPENWEATHER_API_KEY:
@@ -67,7 +80,7 @@ def fetch_weather(mode: str = "today") -> str:
     cnt = 8 if mode == "today" else 40
     url = (
         f"https://api.openweathermap.org/data/2.5/forecast"
-        f"?q=Montreal,CA&appid={OPENWEATHER_API_KEY}&units=metric&cnt={cnt}"
+        f"?q={config.WEATHER_CITY}&appid={OPENWEATHER_API_KEY}&units=metric&cnt={cnt}"
     )
     try:
         r = requests.get(url, timeout=10)
@@ -137,13 +150,8 @@ def fetch_calendar_events(start_offset_days: int = 0, end_offset_days: int = 8) 
         window_end = midnight + datetime.timedelta(days=end_offset_days)
         today_start = window_start  # name kept for downstream references
 
-        # Calendars to check: primary + the shared/subscribed ones
-        calendar_ids = [
-            "primary",
-            "REMOVED_CALENDAR_ID",
-            "REMOVED_CALENDAR_ID",
-            "REMOVED_CALENDAR_ID",
-        ]
+        # Calendars to check: primary + any shared/subscribed ones (from config).
+        calendar_ids = config.CALENDAR_IDS
 
         all_events = []
         for cal_id in calendar_ids:
@@ -206,7 +214,7 @@ def fetch_emails() -> str:
 
         # Relevant unread from last 24h (skipping promos/social/updates/newsletters)
         since = int((datetime.datetime.now() - datetime.timedelta(hours=24)).timestamp())
-        query = f"is:unread after:{since} -category:promotions -category:social -category:updates -label:newsletters -label:News"
+        query = f"is:unread after:{since} -category:promotions -category:social -category:updates -label:newsletters -label:{config.NEWS_LABEL}"
 
         results = service.users().messages().list(
             userId="me", q=query, maxResults=30,
@@ -379,7 +387,7 @@ def fetch_news_from_newsletters(service, news_length: str = "normal") -> str:
     # together with the label, so even if the "News" label holds thousands of emails total,
     # only the last ~13h are returned (a handful in practice). maxResults caps it regardless.
     since = int((datetime.datetime.now() - datetime.timedelta(hours=18)).timestamp())
-    query = f"label:News after:{since}"
+    query = f"label:{config.NEWS_LABEL} after:{since}"
 
     results = service.users().messages().list(
         userId="me", q=query, maxResults=6,
@@ -398,7 +406,7 @@ def fetch_news_from_newsletters(service, news_length: str = "normal") -> str:
         sender = headers.get("From", "Unknown")
         subject = headers.get("Subject", "(no subject)")
         body = _decode_email_body(detail["payload"])
-        body = body[:15000]  # cap per newsletter (raised — extraction is now much denser after stripping link/cell noise)
+        body = body[:15000]  # cap per newsletter (15k; extraction is dense after stripping link/cell noise)
         newsletters.append(f"=== From: {sender} | Subject: {subject} ===\n{body}")
 
     combined = "\n\n".join(newsletters)
@@ -419,7 +427,7 @@ I read the news hourly, so I already know the big headlines. DON'T just recap wh
 HOW TO HANDLE EACH STORY:
 - For major breaking news: give a brief one-line recap for context, then emphasize the specifics — and pull those specifics from ACROSS the different newsletters. Each outlet often has a different angle; synthesize them into one story.
   Example of the style I want:
-  "Montréal shooting: the killer's motive was revealed as [X] (Globe). Police are now warning of potential copycats (NYT)."
+  "Local shooting: the killer's motive was revealed as [X] (Globe). Police are now warning of potential copycats (NYT)."
   → One story, multiple sources, each adding a distinct specific — not the same recap repeated.
 - Group all coverage of the same event into a SINGLE story, even if 3 outlets cover it. A story can carry multiple links.
 
@@ -432,10 +440,9 @@ SELECTION:
   • 📈 Business / markets / macro (~25%)
 
 WHAT INTERESTS ME, BY BUCKET:
-- 🇨🇦 Canada/Quebec: federal AND Quebec politics; constitutional law broadly (the courts, the Charter, anything judicial or legal); party and parliamentary affairs; criminal law; environment; the economy; the French language. Quebec issues of any kind interest me. Favor the specific angle and analysis here — I follow this closely.
-- 🇺🇸 United States: federal politics broadly, especially constitutional debates. I like sharp opinion pieces on current political trends. Favor angle and analysis.
-- 🌍 International: general international news — I'm less expert here, so I'm more open to straightforward breaking-news coverage, not just angles. Cover ASIA when relevant, not only Europe and North America. Don't let this bucket become Europe-only.
-- 📈 Business/markets: anything genuinely interesting — public and private market trends, economic and regulatory policy, technology, central banks, major corporate news. IMPORTANT: the "skip what I already know / give me the angle" rule applies LESS here. For markets, the DATA ITSELF is what I want, even if I "know" it — index moves (S&P, Nasdaq, TSX, KOSPI, etc.), notable earnings (who reports today, who beat/missed), big corporate moves (IPOs, bond sales, lawsuits, M&A), key macro prints (PMI, CPI, rate decisions). If a business/markets newsletter is present (e.g. Economist "Business in Brief"), you MUST surface its key market data and top business stories — do NOT drop this bucket. A concise markets line (e.g. "S&P −1.5%, Nasdaq −2.2% on AI-overvaluation fears; Micron earnings today") is exactly what I want.
+{config.NEWS_INTERESTS}
+
+NOTE ON BUSINESS/MARKETS: the "skip what I already know / give me the angle" rule applies LESS to markets. The DATA ITSELF is wanted even if "known" — index moves (S&P, Nasdaq, TSX, KOSPI, etc.), notable earnings (who reports today, who beat/missed), big corporate moves (IPOs, bond sales, lawsuits, M&A), key macro prints (PMI, CPI, rate decisions). If a business/markets newsletter is present, you MUST surface its key market data and top stories — do NOT drop this bucket. A concise markets line (e.g. "S&P −1.5%, Nasdaq −2.2% on AI-overvaluation fears; Micron earnings today") is exactly what's wanted.
 
 - Beyond the big shared stories, INCLUDE narrower or single-source pieces (including opinion/analysis) when they fit the interests above. Skip lifestyle fluff, puzzles, recipes, horoscopes, and generic opinion that doesn't touch these interests.
 
@@ -540,7 +547,7 @@ def generate_brief(sections: dict, today_str: str, edition_note: str = "") -> st
     system = (
         "You are a personal assistant generating a concise morning brief. "
         "Be direct and scannable. No fluff. Use the raw data provided to produce "
-        "a structured HTML email. The recipient is Élie, a law student in Montréal. "
+        f"a structured HTML email. The recipient is {config.USER_NAME}, {config.USER_DESCRIPTION}. "
         "Write the ENTIRE brief in English (section headers, summaries, everything). "
         "Keep proper nouns and event titles in their original language as they appear "
         "in the data (e.g. a calendar event 'Souper entre chéris' stays as is), but all "
@@ -587,7 +594,7 @@ def generate_brief(sections: dict, today_str: str, edition_note: str = "") -> st
 
     note_line = f"\n{edition_note}\n" if edition_note else ""
 
-    prompt = f"""Today is {today_str}. I'm in Montréal, QC (America/Toronto timezone).{note_line}
+    prompt = f"""Today is {today_str}. I'm {config.USER_DESCRIPTION} ({config.TIMEZONE} timezone).{note_line}
 Here is the raw data. Produce my brief as clean HTML (no markdown). Start with the TL;DR at the very top, then the sections below.
 
 ---

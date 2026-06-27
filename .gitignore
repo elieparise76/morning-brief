@@ -1,0 +1,15 @@
+# Personal config — NEVER commit (holds name, city, calendar IDs, interests)
+config.py
+
+# OAuth tokens and credentials — NEVER commit
+gmail_token.json
+gcal_token.json
+credentials.json
+
+# Debug output (may contain personal newsletter content)
+debug_news_output.txt
+
+# Python
+*.pyc
+__pycache__/
+.env
