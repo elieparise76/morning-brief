@@ -22,6 +22,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Create config.py
+        run: echo "$CONFIG_PY" > config.py
+        env:
+          CONFIG_PY: ${{ secrets.CONFIG_PY }}
+      
       - name: Install dependencies
         run: pip install anthropic google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client requests python-dateutil pytz
 
