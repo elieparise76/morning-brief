@@ -1,151 +1,150 @@
 # Morning Brief — Setup Guide
 
-A GitHub Actions workflow that emails you a daily morning brief at **7:30 AM ET** on weekdays.  
-Runs entirely in the cloud — no Mac required, no app open.
+A GitHub Actions workflow that emails you a personalized daily brief.
+Runs entirely in the cloud — once it's set up, it works on its own with nothing kept
+running on your end.
+
+The delivery time is **not** hardcoded — it's controlled externally by the scheduler
+(cron-job.org), so you can change it whenever you like without touching the code.
 
 ---
 
 ## What it does
 
-Each weekday at 7:30 AM, it:
-1. Pulls today's weather for your city (OpenWeatherMap)
-2. Reads your Google Calendar (today + next 7 days)
-3. Scans your Gmail for unread emails from the last 24h (skipping newsletters/promos)
-4. Calls Claude to generate a clean HTML email from all of the above
-5. Emails you the result via your Gmail account
+Each morning, it:
+1. Pulls the day's weather for your city (OpenWeatherMap)
+2. Reads your Google Calendar (window depends on the edition — see "Editions")
+3. Scans your Gmail for relevant unread email, and lists your starred follow-ups
+4. Curates a news section from newsletters labelled in Gmail (or a web search fallback)
+5. Calls Claude to compose a clean HTML brief from all of the above
+6. Emails it to you via your Gmail account
+
+The content adapts by day of week (a weekday edition, a longer weekend edition, and a
+start-of-week "week ahead" edition on Sunday). See [SYSTEM_GUIDE.md](SYSTEM_GUIDE.md).
 
 ---
 
-## Setup (one-time, ~30 minutes)
+## Setup (one-time)
 
-### Step 1 — Create a GitHub repo
+### Step 1 — Get the project files into a repo
 
-Create a new repo (e.g. `morning-brief`) and add the project files:
+Add the project files to your repo:
 - `.github/workflows/morning_brief.yml`
 - `morning_brief.py`
 - `config.example.py`
 - `debug_news.py`, `get_tokens.py`, `.gitignore`
 
-> **Note:** `config.py` is git-ignored and holds your personal settings — it is created
-> in the next step and must never be committed (safe for a public repo).
+> `config.py` is git-ignored and holds your personal settings. It's created next and must
+> never be committed — which is what makes this repo safe to keep public.
 
 ---
 
-### Step 1b — Create your config
+### Step 2 — Create your config
 
 ```bash
 cp config.example.py config.py
 ```
 
-Edit `config.py` and fill in your name, city, timezone, calendar IDs, news label, and
-interests. See the comments in `config.example.py` for each field.
+Edit `config.py`: your name, city, timezone, calendar IDs, news label, and interests.
+Each field is documented in `config.example.py`.
 
 ---
 
-### Step 2 — Get an Anthropic API key
+### Step 3 — Get an Anthropic API key
 
-Go to https://console.anthropic.com → API Keys → Create key.  
-Save it — you'll add it as a secret in Step 5.
-
----
-
-### Step 3 — Get an OpenWeatherMap API key (free)
-
-1. Sign up at https://openweathermap.org/api
-2. Go to API Keys tab, copy your key.
+https://console.anthropic.com → API Keys → Create key. You'll add it as a secret in Step 6.
 
 ---
 
-### Step 4 — Set up Google OAuth credentials
+### Step 4 — Get an OpenWeatherMap API key (free)
 
-This is the most involved step. You need credentials that can access Gmail and Google Calendar.
+Sign up at https://openweathermap.org/api → API Keys tab → copy your key.
 
-#### 4a — Create a Google Cloud project
+---
 
-1. Go to https://console.cloud.google.com
-2. Create a new project (e.g. "Morning Brief")
-3. Enable these two APIs:
-   - Gmail API
-   - Google Calendar API
-4. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-5. Application type: **Desktop app**
-6. Download the JSON file — this is your `credentials.json`
+### Step 5 — Set up Google OAuth (Gmail + Calendar)
 
-#### 4b — Authorize and get tokens
+The most involved step. You need credentials that can read Gmail/Calendar and send mail.
 
-Run this locally (one-time) to authorize your Google account and generate token files.
+**5a — Google Cloud project**
+1. https://console.cloud.google.com → create a project (e.g. "Morning Brief")
+2. Enable the **Gmail API** and **Google Calendar API**
+3. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
+4. Application type: **Desktop app**
+5. Download the JSON — this is your `credentials.json`
 
-Install dependencies:
+**5b — Authorize and generate tokens (run locally, one time)**
 ```bash
 pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client
-```
-
-Run the auth script:
-```bash
 python get_tokens.py
 ```
-
-This will open a browser, ask you to log in, and save two files:
-- `gmail_token.json`
-- `gcal_token.json`
-
-Keep these safe — they let the script act as you.
+This opens a browser, asks you to log in, and saves `gmail_token.json` and
+`gcal_token.json`. Keep these safe — they let the script act as you. They're git-ignored.
 
 ---
 
-### Step 5 — Add GitHub Secrets
+### Step 6 — Add GitHub Secrets
 
-In your repo: **Settings → Secrets and variables → Actions → New repository secret**
-
-Add these secrets:
+Repo → **Settings → Secrets and variables → Actions → New repository secret**
 
 | Secret name | Value |
 |---|---|
 | `ANTHROPIC_API_KEY` | Your Anthropic API key |
 | `OPENWEATHER_API_KEY` | Your OpenWeatherMap API key |
-| `RECIPIENT_EMAIL` | Your email address (where the brief will be sent) |
-| `GMAIL_TOKEN_JSON` | Contents of `gmail_token.json` (paste the whole JSON) |
-| `GCAL_TOKEN_JSON` | Contents of `gcal_token.json` (paste the whole JSON) |
+| `RECIPIENT_EMAIL` | Where the brief is sent |
+| `GMAIL_TOKEN_JSON` | Full contents of `gmail_token.json` |
+| `GCAL_TOKEN_JSON` | Full contents of `gcal_token.json` |
+| `CONFIG_PY` | Full contents of your `config.py` |
 
-> **Note on `GMAIL_CREDENTIALS_JSON`**: The credentials file is only needed during the one-time token generation (Step 4b). Once you have the token files, you don't need to store the credentials in GitHub.
-
----
-
-### Step 6 — Test it
-
-Go to your repo → **Actions** tab → **Morning Brief** → **Run workflow**.  
-Check your inbox within a minute or two.
+**Why `CONFIG_PY`?** Since `config.py` is git-ignored, it isn't in the repo when GitHub
+Actions runs. The workflow recreates it from this secret at runtime (see the "Create
+config.py" step in the workflow), so your personal settings stay out of the public repo.
 
 ---
 
-## Timezone note
+### Step 7 — Schedule it (cron-job.org)
 
-The workflow runs at `11:30 UTC`, which is:
-- **7:30 AM EDT** (summer, UTC-4) ✓
-- **6:30 AM EST** (winter, UTC-5) — adjust cron to `12:30 UTC` in November
+The workflow is triggered externally for reliable, timezone-aware scheduling. See
+[CRON_SETUP.md](CRON_SETUP.md) for the full walkthrough. In short: a cron-job.org job
+POSTs to the GitHub API on your schedule, which fires the workflow via
+`repository_dispatch`. Because cron-job.org supports real timezones, it handles
+daylight-saving automatically, and you can change the delivery time anytime there —
+no code change needed.
 
-To avoid thinking about this, you can use two cron entries in the workflow:
-```yaml
-- cron: '30 11 * * 1-5'  # Summer (EDT)
-- cron: '30 12 * * 1-5'  # Winter (EST)
-```
-GitHub Actions will just run it twice on the transition days — harmless.
-
----
-
-## Customizing the prompt
-
-Edit the `prompt` variable in `morning_brief.py` to adjust sections, tone, or what to prioritize.
+> The workflow also keeps a backup GitHub `schedule:` cron, but cron-job.org is the
+> primary trigger.
 
 ---
 
-## Upgrading news section
+### Step 8 — Test it
 
-Currently the news section shows a placeholder because the Claude API call doesn't have web search enabled in this setup. To enable live news:
+Repo → **Actions** tab → **Morning Brief** → **Run workflow** (or "Run now" in
+cron-job.org). Check your inbox shortly after.
 
-Option A — Enable web search tool in the Claude API call (add `tools=[{"type": "web_search_20250305", "name": "web_search"}]` to the `client.messages.create()` call).
+---
 
-Option B — Add a separate step that calls a news API (e.g. NewsAPI.org, free tier) and passes headlines as raw data to Claude, same as weather.
+## Editions (per-day content)
+
+The script picks an edition from the weekday — weekday, weekend (Saturday), and
+week-ahead (Sunday) — each with different sections and news length. Full table in
+[SYSTEM_GUIDE.md](SYSTEM_GUIDE.md).
+
+---
+
+## Customizing
+
+- **Personal settings** (name, city, calendars, news label, interests): edit `config.py`.
+- **Behavior** (section rules, news length, token caps, cost knobs): edit `morning_brief.py`.
+- **Inspect what the news step receives**: run `python3 debug_news.py` (writes
+  `debug_news_output.txt`, sends nothing).
+
+---
+
+## Documentation
+
+- [SYSTEM_GUIDE.md](SYSTEM_GUIDE.md) — operations, maintenance schedule, troubleshooting.
+- [CLAUDE.md](CLAUDE.md) — architecture and conventions (for Claude Code / contributors).
+- [CRON_SETUP.md](CRON_SETUP.md) — external scheduler setup.
 
 ---
 
@@ -153,10 +152,15 @@ Option B — Add a separate step that calls a news API (e.g. NewsAPI.org, free t
 
 ```
 morning-brief/
-├── .github/
-│   └── workflows/
-│       └── morning_brief.yml   ← GitHub Actions schedule
-├── morning_brief.py             ← Main script
-├── get_tokens.py                ← One-time auth helper (run locally, don't commit)
-└── README.md
+├── .github/workflows/morning_brief.yml   ← workflow (recreates config.py, runs the script)
+├── morning_brief.py                       ← main script
+├── config.example.py                      ← committed template
+├── config.py                              ← personal settings (GIT-IGNORED)
+├── debug_news.py                          ← news diagnostic (read-only)
+├── get_tokens.py                          ← one-time Google auth helper
+├── .gitignore
+├── README.md
+├── SYSTEM_GUIDE.md
+├── CLAUDE.md
+└── CRON_SETUP.md
 ```
