@@ -13,3 +13,6 @@ debug_news_output.txt
 *.pyc
 __pycache__/
 .env
+
+# Claude.local.md
+CLAUDE.local.md
